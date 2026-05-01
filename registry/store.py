@@ -1,3 +1,5 @@
+"""Persistence helpers for strategy evolution (extended, backward compatible)."""
+
 from __future__ import annotations
 
 import hashlib
@@ -9,8 +11,10 @@ from typing import Any, List
 
 _STORE_PATH = Path(os.getenv("STRATEGY_STORE_FILE", ".strategy_store.json"))
 
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def compute_logic_hash(parameters: dict[str, Any] | None) -> str:
     try:
@@ -18,6 +22,7 @@ def compute_logic_hash(parameters: dict[str, Any] | None) -> str:
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
     except Exception:
         return "unknown"
+
 
 def _load() -> dict[str, Any]:
     if not _STORE_PATH.exists():
@@ -33,11 +38,13 @@ def _load() -> dict[str, Any]:
     data.setdefault("counters", {"experiment_id": 0, "evolution_id": 0})
     return data
 
+
 def _save(store: dict[str, Any]) -> None:
     tmp = _STORE_PATH.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as fh:
         json.dump(store, fh, indent=2, sort_keys=True, default=str)
     tmp.replace(_STORE_PATH)
+
 
 def _jsonable(value: Any) -> Any:
     if isinstance(value, dict):
@@ -49,6 +56,7 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     return value
+
 
 def _row(strategy_id: str, row: dict[str, Any] | None) -> dict[str, Any]:
     if not row:
@@ -73,6 +81,7 @@ def _row(strategy_id: str, row: dict[str, Any] | None) -> dict[str, Any]:
         "validated_at": row.get("validated_at"),
     }
 
+
 def upsert_strategy(
     strategy_id: str,
     *,
@@ -91,8 +100,15 @@ def upsert_strategy(
     parent_strategy_id: str | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
+    """Create or update a strategy row.
+
+    **kwargs is accepted for backward compatibility with older callers.
+    Unknown extras are folded into parameters._meta so callers do not crash.
+    """
     store = _load()
     now = _now()
+
+    # Backward-compatible ingestion of extra fields.
     extras = dict(kwargs or {})
     if extras:
         params = dict(parameters or {})
@@ -124,6 +140,7 @@ def upsert_strategy(
     _save(store)
     return _row(strategy_id, row)
 
+
 def record_experiment(
     strategy_id: str,
     *,
@@ -152,6 +169,7 @@ def record_experiment(
     store["experiments"].append(row)
     _save(store)
     return row
+
 
 def record_evolution_run(
     *,
@@ -188,6 +206,7 @@ def record_evolution_run(
     _save(store)
     return row
 
+
 def list_strategies(active_only: bool = False) -> list[dict[str, Any]]:
     store = _load()
     rows = [_row(strategy_id, row) for strategy_id, row in store["registry"].items()]
@@ -196,8 +215,17 @@ def list_strategies(active_only: bool = False) -> list[dict[str, Any]]:
     rows.sort(key=lambda r: (r.get("updated_at") or "", r.get("created_at") or ""), reverse=True)
     return rows
 
-def rank_strategies(*, symbol: str | None = None, timeframe: str | None = None, regime: str | None = None, active_only: bool = True, limit: int = 10) -> List[dict[str, Any]]:
+
+def rank_strategies(
+    *,
+    symbol: str | None = None,
+    timeframe: str | None = None,
+    regime: str | None = None,
+    active_only: bool = True,
+    limit: int = 10,
+) -> List[dict[str, Any]]:
     rows = list_strategies(active_only=active_only)
+
     def _match(r):
         tags = {str(t).lower() for t in (r.get("tags") or [])}
         if symbol and symbol.lower() not in tags:
@@ -207,23 +235,33 @@ def rank_strategies(*, symbol: str | None = None, timeframe: str | None = None, 
         if regime and (r.get("regime_profile") or "") != regime:
             return False
         return True
+
     rows = [r for r in rows if _match(r)]
+
     def _score(r):
         m = r.get("metrics") or {}
         decision = m.get("decision") or {}
-        return (float(decision.get("score", 0.0)), float(r.get("robustness_score", 0.0)), r.get("updated_at") or "")
+        return (
+            float(decision.get("score", 0.0)),
+            float(r.get("robustness_score", 0.0)),
+            r.get("updated_at") or "",
+        )
+
     rows.sort(key=_score, reverse=True)
     return rows[:limit]
+
 
 def get_strategy(strategy_id: str) -> dict[str, Any]:
     store = _load()
     return _row(strategy_id, store["registry"].get(strategy_id))
+
 
 def list_experiments(strategy_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
     store = _load()
     rows = [e for e in store["experiments"] if strategy_id is None or e.get("strategy_id") == strategy_id]
     rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
     return rows[: max(1, int(limit))]
+
 
 def list_evolution_runs(strategy_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
     store = _load()
