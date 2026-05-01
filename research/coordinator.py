@@ -1,9 +1,16 @@
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from datetime import datetime, timezone
+from typing import Any
+
 from execution.backtest.core import run_backtest
 from research.diagnostics import build_candidate_diagnostics
 from research.feedback import build_feedback_summary
-from research.candidate_generator import mutate_parent, seed_strategy
+from research.candidate_generator import mutate_parent
 from registry.bootstrap import init_db
-init_db()
 from registry.store import (
     list_strategies,
     record_experiment,
@@ -20,7 +27,7 @@ DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "LINK/USDT", "AVAX/USDT",
 DEFAULT_TIMEFRAMES = ["1d", "4h"]
 
 
-def _now_iso():
+def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
@@ -52,7 +59,7 @@ def _score_row(r: dict[str, Any]) -> float:
     return score + bonus
 
 
-def _pick_parent(symbol, timeframe):
+def _pick_parent(symbol: str, timeframe: str):
     s = symbol.lower()
     t = timeframe.lower()
 
@@ -63,7 +70,6 @@ def _pick_parent(symbol, timeframe):
 
     rows = list_strategies(active_only=False)
     matches = [r for r in rows if s in {str(x).lower() for x in (r.get("tags") or [])} and t in {str(x).lower() for x in (r.get("tags") or [])} and r.get("status") != "running"]
-
     if matches:
         return sorted(matches, key=_score_row, reverse=True)[0]
 
@@ -73,7 +79,6 @@ def _pick_parent(symbol, timeframe):
 def _feedback_from_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
     wf = metrics.get("walk_forward") or {}
     diag = metrics.get("diagnostics") or {}
-
     activity = diag.get("trade_activity") or {}
     means = (wf.get("means") or {}) if isinstance(wf.get("means"), dict) else {}
 
@@ -106,17 +111,56 @@ def _merge_feedback(parent_feedback: dict, store_feedback: dict) -> dict:
 
 
 def _too_restrictive(params: dict[str, Any]) -> bool:
-    flags = [params.get("use_htf_filter", False), params.get("use_volume_filter", False), params.get("use_structure_filter", False), params.get("use_trend_filter", False)]
-    high_thresholds = (_safe_float(params.get("min_adx", 0), 0) > 10 and _safe_float(params.get("min_atr_rank", 0), 0) > 0.08 and _safe_float(params.get("min_bb_rank", 0), 0) > 0.08)
+    flags = [
+        params.get("use_htf_filter", False),
+        params.get("use_volume_filter", False),
+        params.get("use_structure_filter", False),
+        params.get("use_trend_filter", False),
+    ]
+    high_thresholds = (
+        _safe_float(params.get("min_adx", 0), 0) > 10
+        and _safe_float(params.get("min_atr_rank", 0), 0) > 0.08
+        and _safe_float(params.get("min_bb_rank", 0), 0) > 0.08
+    )
     return sum(1 for f in flags if f) >= 3 and high_thresholds
 
 
 def _run_split(child, start, end, allow_shorts, max_bars, use_cache):
-    override = {"strategy_id": child.base_strategy, "base_strategy": child.base_strategy, "version": child.version - 1, "parameters": child.parameters}
-    return run_backtest(child.symbol, child.timeframe, start=start, end=end, allow_shorts=allow_shorts or bool(child.parameters.get("allow_shorts", False)), max_bars=max_bars, use_cache=use_cache, strategy_override=override)
+    override = {
+        "strategy_id": child.base_strategy,
+        "base_strategy": child.base_strategy,
+        "version": child.version - 1,
+        "parameters": child.parameters,
+    }
+    return run_backtest(
+        child.symbol,
+        child.timeframe,
+        start=start,
+        end=end,
+        allow_shorts=allow_shorts or bool(child.parameters.get("allow_shorts", False)),
+        max_bars=max_bars,
+        use_cache=use_cache,
+        strategy_override=override,
+    )
 
 
-def evolve_once(symbols, timeframes, children_per_parent=4, max_bars=0, allow_shorts=False, start=None, end=None, lookback_days=720, folds=3, train_ratio=0.6, val_ratio=0.2, test_ratio=0.2, use_cache=True, family="evo", seed=None):
+def evolve_once(
+    symbols,
+    timeframes,
+    children_per_parent=4,
+    max_bars=0,
+    allow_shorts=False,
+    start=None,
+    end=None,
+    lookback_days=720,
+    folds=3,
+    train_ratio=0.6,
+    val_ratio=0.2,
+    test_ratio=0.2,
+    use_cache=True,
+    family="evo",
+    seed=None,
+):
     try:
         init_db()
     except Exception:
@@ -150,17 +194,42 @@ def evolve_once(symbols, timeframes, children_per_parent=4, max_bars=0, allow_sh
                 candidate_rows.append((child, should_skip, is_restrictive))
 
             if candidate_rows and all(skip for _, skip, _ in candidate_rows):
-                candidate_rows.sort(key=lambda item: (item[2], _safe_float(item[0].parameters.get("min_adx", 0), 0.0), _safe_float(item[0].parameters.get("min_bb_rank", 0), 0.0), _safe_float(item[0].parameters.get("min_atr_rank", 0), 0.0)))
+                candidate_rows.sort(
+                    key=lambda item: (
+                        item[2],
+                        _safe_float(item[0].parameters.get("min_adx", 0), 0.0),
+                        _safe_float(item[0].parameters.get("min_bb_rank", 0), 0.0),
+                        _safe_float(item[0].parameters.get("min_atr_rank", 0), 0.0),
+                    )
+                )
                 candidate_rows[0] = (candidate_rows[0][0], False, candidate_rows[0][2])
 
             for child, should_skip, _ in candidate_rows:
                 if should_skip:
                     continue
 
-                upsert_strategy(child.strategy_id, base_strategy=child.base_strategy, version=child.version, status="candidate", parameters=child.parameters, metrics={}, tags=child.tags, source=child.source, notes=child.notes, active=False)
+                upsert_strategy(
+                    child.strategy_id,
+                    base_strategy=child.base_strategy,
+                    version=child.version,
+                    status="candidate",
+                    parameters=child.parameters,
+                    metrics={},
+                    tags=child.tags,
+                    source=child.source,
+                    notes=child.notes,
+                    active=False,
+                )
 
                 try:
-                    record_evolution_run(cycle_id=cycle_id, symbol=child.symbol, timeframe=child.timeframe, parent_strategy_id=(parent or {}).get("strategy_id"), child_strategy_id=child.strategy_id, status="running")
+                    record_evolution_run(
+                        cycle_id=cycle_id,
+                        symbol=child.symbol,
+                        timeframe=child.timeframe,
+                        parent_strategy_id=(parent or {}).get("strategy_id"),
+                        child_strategy_id=child.strategy_id,
+                        status="running",
+                    )
                 except Exception:
                     pass
 
@@ -183,11 +252,40 @@ def evolve_once(symbols, timeframes, children_per_parent=4, max_bars=0, allow_sh
                 metrics = {"walk_forward": summary, "diagnostics": diagnostics}
                 passed = bool(summary.get("passed"))
 
-                upsert_strategy(child.strategy_id, base_strategy=child.base_strategy, version=child.version, status=("validated" if passed else "rejected"), parameters=child.parameters, metrics=metrics, tags=child.tags, source=child.source, notes=child.notes, active=passed, validated_at=_now_iso() if passed else None)
+                upsert_strategy(
+                    child.strategy_id,
+                    base_strategy=child.base_strategy,
+                    version=child.version,
+                    status=("validated" if passed else "rejected"),
+                    parameters=child.parameters,
+                    metrics=metrics,
+                    tags=child.tags,
+                    source=child.source,
+                    notes=child.notes,
+                    active=passed,
+                    validated_at=_now_iso() if passed else None,
+                )
 
-                record_experiment(child.strategy_id, symbol=child.symbol, timeframe=child.timeframe, run_type="walkforward_backtest", parameters=child.parameters, metrics=metrics, passed=passed, notes=f"cycle_id={cycle_id}")
+                record_experiment(
+                    child.strategy_id,
+                    symbol=child.symbol,
+                    timeframe=child.timeframe,
+                    run_type="walkforward_backtest",
+                    parameters=child.parameters,
+                    metrics=metrics,
+                    passed=passed,
+                    notes=f"cycle_id={cycle_id}",
+                )
 
-                results.append({"strategy_id": child.strategy_id, "symbol": child.symbol, "timeframe": child.timeframe, "walk_forward": summary, "feedback": combined_feedback})
+                results.append(
+                    {
+                        "strategy_id": child.strategy_id,
+                        "symbol": child.symbol,
+                        "timeframe": child.timeframe,
+                        "walk_forward": summary,
+                        "feedback": combined_feedback,
+                    }
+                )
 
     return results
 
@@ -226,6 +324,24 @@ if __name__ == "__main__":
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     timeframes = [t.strip() for t in args.timeframes.split(",") if t.strip()]
 
-    results = evolve(symbols, timeframes, max_cycles=args.max_cycles, sleep_seconds=args.sleep_seconds, children_per_parent=args.children_per_parent, max_bars=args.max_bars, allow_shorts=args.allow_shorts, start=args.start, end=args.end, lookback_days=args.lookback_days, folds=args.folds, train_ratio=args.train_ratio, val_ratio=args.val_ratio, test_ratio=args.test_ratio, use_cache=not args.no_cache, family=args.family, seed=args.seed)
+    results = evolve(
+        symbols,
+        timeframes,
+        max_cycles=args.max_cycles,
+        sleep_seconds=args.sleep_seconds,
+        children_per_parent=args.children_per_parent,
+        max_bars=args.max_bars,
+        allow_shorts=args.allow_shorts,
+        start=args.start,
+        end=args.end,
+        lookback_days=args.lookback_days,
+        folds=args.folds,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
+        use_cache=not args.no_cache,
+        family=args.family,
+        seed=args.seed,
+    )
 
     print(json.dumps({"results": results}, indent=2))
