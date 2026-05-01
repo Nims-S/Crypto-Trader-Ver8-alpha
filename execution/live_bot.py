@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import asyncio
 from typing import Any, Dict
 
 from config.defaults import DEFAULT_SYMBOLS, DEFAULT_TIMEFRAMES
@@ -11,11 +12,27 @@ from execution.drift_monitor import compare_performance
 from execution.portfolio_state import PortfolioState
 from execution.executor import TradeExecutor
 from execution.market_data import load_market_bundle
+from execution.async_market_data import load_market_cache_async
+from execution.portfolio_intelligence import build_portfolio_intelligence, portfolio_snapshot
 from execution.live_metrics import summarize_trades
 from execution.state_store import load_portfolio_state, save_portfolio_state, ensure_parent_dir
 from execution.lifecycle import update_runtime, lifecycle_multiplier
 from registry.store import record_experiment, upsert_strategy
 from strategy import StrategyState, generate_signal
+
+
+def _load_market_cache(symbols, timeframes):
+    try:
+        return asyncio.run(load_market_cache_async(symbols, timeframes))
+    except Exception:
+        cache: Dict[tuple[str, str], tuple[Any, Any, str]] = {}
+        for symbol in symbols:
+            for tf in timeframes:
+                try:
+                    cache[(symbol, tf)] = load_market_bundle(symbol, tf)
+                except Exception:
+                    pass
+        return cache
 
 
 def run_live_cycle(
@@ -38,30 +55,19 @@ def run_live_cycle(
     symbols = list(DEFAULT_SYMBOLS)
     timeframes = list(DEFAULT_TIMEFRAMES)
 
-    regimes: Dict[tuple[str, str], str | None] = {}
-    market_cache: Dict[tuple[str, str], tuple[Any, Any, str]] = {}
+    market_cache = _load_market_cache(symbols, timeframes)
 
-    for symbol in symbols:
-        for tf in timeframes:
-            try:
-                ltf, htf, regime = load_market_bundle(symbol, tf)
-                regimes[(symbol, tf)] = regime
-                market_cache[(symbol, tf)] = (ltf, htf, regime)
-            except Exception:
-                regimes[(symbol, tf)] = None
+    regimes: Dict[tuple[str, str], str | None] = {}
+    for key, bundle in market_cache.items():
+        regimes[key] = bundle[2] if bundle else None
 
     routed = route_strategies(symbols, timeframes, regimes=regimes)
     strategy_rows = [r["strategy"] for r in routed]
 
-    context: Dict[str, dict] = {}
-    for sid, rt in portfolio.strategy_runtime.items():
-        context[sid] = {
-            "multiplier": lifecycle_multiplier(rt, portfolio.cycle),
-            "enabled": True,
-        }
+    intelligence = build_portfolio_intelligence(routed, portfolio, market_cache)
 
     free_cash = max(float(portfolio.cash), 0.0)
-    allocations = allocate_capital(strategy_rows, free_cash, context=context)
+    allocations = allocate_capital(strategy_rows, free_cash, context=intelligence)
     portfolio.apply_allocations(allocations)
 
     executor = TradeExecutor(paper_trading=PAPER_TRADING)
@@ -158,7 +164,7 @@ def run_live_cycle(
             timeframe=tf,
             run_type="live_cycle",
             parameters=row.get("parameters"),
-            metrics={"live": live_stats, "drift": drift},
+            metrics={"live": live_stats, "drift": drift, "intelligence": intelligence.get(sid)},
             passed=(drift.get("status") != "disable"),
         )
 
@@ -167,6 +173,7 @@ def run_live_cycle(
             "allocation": alloc,
             "live": live_stats,
             "drift": drift,
+            "intelligence": intelligence.get(sid),
         })
 
     ensure_parent_dir(state_file)
@@ -178,6 +185,7 @@ def run_live_cycle(
         "cash": portfolio.cash,
         "open_positions": list(portfolio.positions.values()),
         "cycle": portfolio.cycle,
+        "snapshot": portfolio_snapshot(portfolio),
     }
 
 
