@@ -1,0 +1,1 @@
+"""Live bot entrypoint placeholder."""
