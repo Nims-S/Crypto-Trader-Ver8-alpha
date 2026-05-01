@@ -8,3 +8,4 @@ Ver8 reorganizes the bot into three layers:
 - `strategy/` — signal logic, indicators, regime detection
 
 This scaffold is a migration target from the Ver7 branch.
+hi
