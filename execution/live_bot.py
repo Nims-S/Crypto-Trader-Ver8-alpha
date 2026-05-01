@@ -16,7 +16,7 @@ from execution.async_market_data import load_market_cache_async
 from execution.portfolio_intelligence import build_portfolio_intelligence, portfolio_snapshot
 from execution.live_metrics import summarize_trades
 from execution.state_store import load_portfolio_state, save_portfolio_state, ensure_parent_dir
-from execution.lifecycle import update_runtime, lifecycle_multiplier
+from execution.lifecycle import update_runtime
 from registry.store import record_experiment, upsert_strategy
 from strategy import StrategyState, generate_signal
 
@@ -73,6 +73,7 @@ def run_live_cycle(
     executor = TradeExecutor(paper_trading=PAPER_TRADING)
 
     reports = []
+    closed_this_cycle = set()
 
     for route in routed:
         sid = route.get("strategy_id")
@@ -98,11 +99,13 @@ def run_live_cycle(
                 close_result = executor.close_position(pos, exit_price=current_price, reason="stop_loss")
                 trade = portfolio.close_position(sid, float(close_result.get("exit_price", current_price)), "stop_loss")
                 if trade:
+                    closed_this_cycle.add(sid)
                     record_experiment(sid, symbol=symbol, timeframe=tf, run_type="live_cycle", metrics={"trade": trade, "close_result": close_result}, passed=False)
             elif tp > 0 and current_price >= tp:
                 close_result = executor.close_position(pos, exit_price=current_price, reason="take_profit")
                 trade = portfolio.close_position(sid, float(close_result.get("exit_price", current_price)), "take_profit")
                 if trade:
+                    closed_this_cycle.add(sid)
                     record_experiment(sid, symbol=symbol, timeframe=tf, run_type="live_cycle", metrics={"trade": trade, "close_result": close_result}, passed=True)
 
         params = row.get("parameters") or {}
@@ -123,7 +126,7 @@ def run_live_cycle(
                 notes="signal generation failed",
             )
 
-        if not portfolio.get_position(sid) and signal:
+        if sid not in closed_this_cycle and not portfolio.get_position(sid) and signal:
             result = executor.open_position(
                 strategy_id=sid,
                 symbol=symbol,
