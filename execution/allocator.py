@@ -29,11 +29,12 @@ def _apply_caps(
     context: Dict[str, dict[str, Any]] | None,
     temperature: float,
 ) -> List[float]:
-    # initial weights
+    if total_capital <= 0 or not scores or max(scores) <= 0:
+        return [0.0 for _ in strategies]
+
     weights = _softmax(scores, temperature=temperature)
     capitals = [total_capital * w for w in weights]
 
-    # iterative capping and redistribution
     for _ in range(5):
         capped = [False] * len(capitals)
         for i, row in enumerate(strategies):
@@ -49,11 +50,12 @@ def _apply_caps(
         if remaining <= 1e-9:
             break
 
-        # redistribute among uncapped
         uncapped_idx = [i for i, c in enumerate(capped) if not c]
         if not uncapped_idx:
             break
         uncapped_scores = [scores[i] for i in uncapped_idx]
+        if not uncapped_scores or max(uncapped_scores) <= 0:
+            break
         sub_weights = _softmax(uncapped_scores, temperature=temperature)
         for w, i in zip(sub_weights, uncapped_idx):
             capitals[i] += remaining * w
@@ -83,8 +85,6 @@ def allocate_capital(
         scores.append(score)
 
     capitals = _apply_caps(strategies, scores, float(total_capital or 0.0), context, temperature)
-
-    # normalize weights from capitals
     total = sum(capitals) or 1.0
     weights = [c / total for c in capitals]
 
