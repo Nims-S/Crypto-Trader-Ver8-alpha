@@ -53,7 +53,6 @@ def run_live_cycle(
     routed = route_strategies(symbols, timeframes, regimes=regimes)
     strategy_rows = [r["strategy"] for r in routed]
 
-    # build lifecycle context
     context: Dict[str, dict] = {}
     for sid, rt in portfolio.strategy_runtime.items():
         context[sid] = {
@@ -61,7 +60,8 @@ def run_live_cycle(
             "enabled": True,
         }
 
-    allocations = allocate_capital(strategy_rows, portfolio.total_capital, context=context)
+    free_cash = max(float(portfolio.cash), 0.0)
+    allocations = allocate_capital(strategy_rows, free_cash, context=context)
     portfolio.apply_allocations(allocations)
 
     executor = TradeExecutor(paper_trading=PAPER_TRADING)
@@ -89,21 +89,33 @@ def run_live_cycle(
             stop = float(pos.get("stop_loss") or 0.0)
             tp = float(pos.get("take_profit") or 0.0)
             if stop > 0 and current_price <= stop:
-                trade = portfolio.close_position(sid, current_price, "stop_loss")
+                close_result = executor.close_position(pos, exit_price=current_price, reason="stop_loss")
+                trade = portfolio.close_position(sid, float(close_result.get("exit_price", current_price)), "stop_loss")
                 if trade:
-                    record_experiment(sid, symbol=symbol, timeframe=tf, run_type="live_cycle", metrics={"trade": trade}, passed=False)
+                    record_experiment(sid, symbol=symbol, timeframe=tf, run_type="live_cycle", metrics={"trade": trade, "close_result": close_result}, passed=False)
             elif tp > 0 and current_price >= tp:
-                trade = portfolio.close_position(sid, current_price, "take_profit")
+                close_result = executor.close_position(pos, exit_price=current_price, reason="take_profit")
+                trade = portfolio.close_position(sid, float(close_result.get("exit_price", current_price)), "take_profit")
                 if trade:
-                    record_experiment(sid, symbol=symbol, timeframe=tf, run_type="live_cycle", metrics={"trade": trade}, passed=True)
+                    record_experiment(sid, symbol=symbol, timeframe=tf, run_type="live_cycle", metrics={"trade": trade, "close_result": close_result}, passed=True)
 
         params = row.get("parameters") or {}
         state = StrategyState(allow_shorts=bool(params.get("allow_shorts", False)))
         signal = None
         try:
             signal = generate_signal(ltf, state=state, symbol=symbol, df_htf=htf, strategy_override=params)
-        except Exception:
+        except Exception as e:
             signal = None
+            record_experiment(
+                sid,
+                symbol=symbol,
+                timeframe=tf,
+                run_type="live_cycle",
+                parameters=row.get("parameters"),
+                metrics={"error": str(e)},
+                passed=False,
+                notes="signal generation failed",
+            )
 
         if not portfolio.get_position(sid) and signal:
             result = executor.open_position(
@@ -124,7 +136,6 @@ def run_live_cycle(
         expected = (row.get("metrics") or {}).get("walk_forward") or {}
         drift = compare_performance(expected, live_stats)
 
-        # update lifecycle
         runtime = portfolio.strategy_runtime.get(sid, {})
         portfolio.strategy_runtime[sid] = update_runtime(runtime, live=live_stats, drift=drift, cycle=portfolio.cycle)
 
