@@ -28,11 +28,21 @@ def allocate_capital(
     *,
     temperature: float = 1.0,
     min_weight: float = 0.0,
+    context: Dict[str, dict] | None = None,
 ) -> List[Dict[str, Any]]:
     if not strategies:
         return []
 
-    scores = [_score_row(r) for r in strategies]
+    scores = []
+    for r in strategies:
+        sid = r.get("strategy_id")
+        base = _score_row(r)
+        ctx = (context or {}).get(sid, {})
+        mult = float(ctx.get("multiplier", 1.0))
+        enabled = bool(ctx.get("enabled", True))
+        score = base * mult if enabled else 0.0
+        scores.append(score)
+
     weights = _softmax(scores, temperature=temperature)
 
     if min_weight > 0:
