@@ -17,6 +17,7 @@ from execution.portfolio_intelligence import build_portfolio_intelligence, portf
 from execution.live_metrics import summarize_trades
 from execution.state_store import load_portfolio_state, save_portfolio_state, ensure_parent_dir
 from execution.lifecycle import update_runtime
+from execution.realism import estimate_execution
 from registry.store import record_experiment, upsert_strategy
 from strategy import StrategyState, generate_signal
 
@@ -96,17 +97,27 @@ def run_live_cycle(
             stop = float(pos.get("stop_loss") or 0.0)
             tp = float(pos.get("take_profit") or 0.0)
             if stop > 0 and current_price <= stop:
-                close_result = executor.close_position(pos, exit_price=current_price, reason="stop_loss")
-                trade = portfolio.close_position(sid, float(close_result.get("exit_price", current_price)), "stop_loss")
-                if trade:
-                    closed_this_cycle.add(sid)
-                    record_experiment(sid, symbol=symbol, timeframe=tf, run_type="live_cycle", metrics={"trade": trade, "close_result": close_result}, passed=False)
+                exec_ctx = estimate_execution(ltf, price=current_price, side=pos.get("side", "LONG"), notional=float(pos.get("capital", 0.0)), symbol=symbol, timeframe=tf, cycle=portfolio.cycle, action="close")
+                if exec_ctx.get("filled"):
+                    close_result = executor.close_position(pos, exit_price=exec_ctx.get("fill_price", current_price), reason="stop_loss")
+                    trade = portfolio.close_position(sid, float(close_result.get("exit_price", current_price)), "stop_loss")
+                    if trade:
+                        trade.update(exec_ctx)
+                        closed_this_cycle.add(sid)
+                        record_experiment(sid, symbol=symbol, timeframe=tf, run_type="live_cycle", metrics={"trade": trade, "execution": exec_ctx}, passed=False)
+                else:
+                    record_experiment(sid, symbol=symbol, timeframe=tf, run_type="live_cycle", metrics={"skip": "close_missed_fill", "execution": exec_ctx}, passed=False)
             elif tp > 0 and current_price >= tp:
-                close_result = executor.close_position(pos, exit_price=current_price, reason="take_profit")
-                trade = portfolio.close_position(sid, float(close_result.get("exit_price", current_price)), "take_profit")
-                if trade:
-                    closed_this_cycle.add(sid)
-                    record_experiment(sid, symbol=symbol, timeframe=tf, run_type="live_cycle", metrics={"trade": trade, "close_result": close_result}, passed=True)
+                exec_ctx = estimate_execution(ltf, price=current_price, side=pos.get("side", "LONG"), notional=float(pos.get("capital", 0.0)), symbol=symbol, timeframe=tf, cycle=portfolio.cycle, action="close")
+                if exec_ctx.get("filled"):
+                    close_result = executor.close_position(pos, exit_price=exec_ctx.get("fill_price", current_price), reason="take_profit")
+                    trade = portfolio.close_position(sid, float(close_result.get("exit_price", current_price)), "take_profit")
+                    if trade:
+                        trade.update(exec_ctx)
+                        closed_this_cycle.add(sid)
+                        record_experiment(sid, symbol=symbol, timeframe=tf, run_type="live_cycle", metrics={"trade": trade, "execution": exec_ctx}, passed=True)
+                else:
+                    record_experiment(sid, symbol=symbol, timeframe=tf, run_type="live_cycle", metrics={"skip": "close_missed_fill", "execution": exec_ctx}, passed=False)
 
         params = row.get("parameters") or {}
         state = StrategyState(allow_shorts=bool(params.get("allow_shorts", False)))
@@ -127,16 +138,27 @@ def run_live_cycle(
             )
 
         if sid not in closed_this_cycle and not portfolio.get_position(sid) and signal:
-            result = executor.open_position(
-                strategy_id=sid,
-                symbol=symbol,
-                timeframe=tf,
-                signal=signal,
-                capital=capital,
-                current_price=current_price,
-            )
-            if result.get("status") == "opened":
-                portfolio.open_position(result.get("position"))
+            exec_ctx = estimate_execution(ltf, price=current_price, side=getattr(signal, "side", "LONG"), notional=capital, symbol=symbol, timeframe=tf, cycle=portfolio.cycle, action="open")
+            if exec_ctx.get("filled"):
+                # override entry price with realistic fill
+                try:
+                    setattr(signal, "entry_price", exec_ctx.get("fill_price", current_price))
+                except Exception:
+                    pass
+                result = executor.open_position(
+                    strategy_id=sid,
+                    symbol=symbol,
+                    timeframe=tf,
+                    signal=signal,
+                    capital=capital,
+                    current_price=exec_ctx.get("fill_price", current_price),
+                )
+                if result.get("status") == "opened":
+                    pos_dict = result.get("position") or {}
+                    pos_dict.update(exec_ctx)
+                    portfolio.open_position(pos_dict)
+            else:
+                record_experiment(sid, symbol=symbol, timeframe=tf, run_type="live_cycle", metrics={"skip": "open_missed_fill", "execution": exec_ctx}, passed=False)
 
         trades = [t for t in portfolio.trade_history if t.get("strategy_id") == sid]
         live_stats = summarize_trades(trades)
