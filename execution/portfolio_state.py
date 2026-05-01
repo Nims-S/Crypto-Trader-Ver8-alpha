@@ -12,9 +12,10 @@ class PortfolioState:
     positions: Dict[str, dict] = field(default_factory=dict)
     trade_history: List[dict] = field(default_factory=list)
     live_metrics: Dict[str, dict] = field(default_factory=dict)
+    strategy_runtime: Dict[str, dict] = field(default_factory=dict)
+    cycle: int = 0
 
     def apply_allocations(self, allocs: list[dict]):
-        # Allocations are advisory in the live loop; actual cash moves on open/close.
         self.allocations = {a["strategy_id"]: float(a.get("capital", 0.0)) for a in allocs}
 
     def open_position(self, position: dict):
@@ -65,3 +66,28 @@ class PortfolioState:
 
     def get_live_metrics(self, strategy_id: str) -> dict[str, Any]:
         return self.live_metrics.get(strategy_id, {})
+
+    def to_dict(self) -> dict:
+        return {
+            "total_capital": self.total_capital,
+            "cash": self.cash,
+            "allocations": self.allocations,
+            "positions": self.positions,
+            "trade_history": self.trade_history,
+            "live_metrics": self.live_metrics,
+            "strategy_runtime": self.strategy_runtime,
+            "cycle": self.cycle,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "PortfolioState":
+        return cls(
+            total_capital=float(data.get("total_capital", 0.0)),
+            cash=float(data.get("cash", 0.0)),
+            allocations=dict(data.get("allocations", {})),
+            positions=dict(data.get("positions", {})),
+            trade_history=list(data.get("trade_history", [])),
+            live_metrics=dict(data.get("live_metrics", {})),
+            strategy_runtime=dict(data.get("strategy_runtime", {})),
+            cycle=int(data.get("cycle", 0)),
+        )
