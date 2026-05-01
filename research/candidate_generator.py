@@ -4,7 +4,7 @@ import random
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from feedback_engine import build_feedback_summary
+from research.feedback import build_feedback_summary
 
 
 @dataclass

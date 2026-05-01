@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from evolution import score_metrics
+from research.scoring import score_metrics
 
 
 @dataclass(frozen=True)

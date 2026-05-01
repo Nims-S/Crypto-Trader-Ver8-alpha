@@ -1,18 +1,20 @@
-from __future__ import annotations
-
-import argparse
-import json
-import time
-from datetime import datetime, timezone
-from typing import Any
-
-from backtest import run_backtest
-from diagnostics import build_candidate_diagnostics
-from db import init_db
-from feedback_engine import build_feedback_summary
-from mutation_engine import mutate_parent, seed_strategy
-from strategy_registry import list_strategies, record_experiment, record_evolution_run, upsert_strategy
-from validation import build_walk_forward_folds, default_evolution_window, summarize_walk_forward_reports
+from execution.backtest.core import run_backtest
+from research.diagnostics import build_candidate_diagnostics
+from research.feedback import build_feedback_summary
+from research.candidate_generator import mutate_parent, seed_strategy
+from registry.bootstrap import init_db
+init_db()
+from registry.store import (
+    list_strategies,
+    record_experiment,
+    record_evolution_run,
+    upsert_strategy,
+)
+from research.validation import (
+    build_walk_forward_folds,
+    default_evolution_window,
+    summarize_walk_forward_reports,
+)
 
 DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "LINK/USDT", "AVAX/USDT", "SOL/USDT"]
 DEFAULT_TIMEFRAMES = ["1d", "4h"]

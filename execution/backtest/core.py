@@ -11,8 +11,8 @@ import ccxt
 import numpy as np
 import pandas as pd
 
-from strategy import StrategyState, compute_indicators, generate_signal
-from strategy_registry import record_experiment, upsert_strategy
+from registry.store import record_experiment, upsert_strategy
+from research.scoring import score_metrics, promotion_status
 
 exchange = ccxt.binance({"enableRateLimit": True, "timeout": 20000})
 CACHE_DIR = Path(".backtest_cache")

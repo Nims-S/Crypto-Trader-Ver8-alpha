@@ -27,3 +27,7 @@ def score_metrics(m: dict) -> ScoreDecision:
     if wr < 0.45: reasons.append("wr<0.45")
     score = (0.4 * min(pf / 2.0, 1) + 0.3 * wr + 0.2 * max(0, 1 + dd / 20) + 0.1 * min(trades / 40, 1))
     return ScoreDecision(score, len(reasons) == 0 and score > 0.55, tuple(reasons))
+
+
+def promotion_status(decision):
+    return "validated" if decision.passed else "rejected"
