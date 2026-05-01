@@ -14,13 +14,17 @@ class PortfolioState:
     live_metrics: Dict[str, dict] = field(default_factory=dict)
 
     def apply_allocations(self, allocs: list[dict]):
-        self.allocations = {a["strategy_id"]: a["capital"] for a in allocs}
-        self.cash = self.total_capital - sum(self.allocations.values())
+        # Allocations are advisory in the live loop; actual cash moves on open/close.
+        self.allocations = {a["strategy_id"]: float(a.get("capital", 0.0)) for a in allocs}
 
     def open_position(self, position: dict):
         sid = position.get("strategy_id")
         if not sid:
             return
+        capital = float(position.get("capital") or 0.0)
+        if capital > self.cash:
+            return
+        self.cash -= capital
         self.positions[sid] = position
 
     def close_position(self, sid: str, exit_price: float, reason: str) -> dict | None:
