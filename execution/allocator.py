@@ -22,6 +22,45 @@ def _score_row(row: dict[str, Any]) -> float:
     return base * (1.0 + 0.3 * robustness)
 
 
+def _apply_caps(
+    strategies: List[dict[str, Any]],
+    scores: List[float],
+    total_capital: float,
+    context: Dict[str, dict[str, Any]] | None,
+    temperature: float,
+) -> List[float]:
+    # initial weights
+    weights = _softmax(scores, temperature=temperature)
+    capitals = [total_capital * w for w in weights]
+
+    # iterative capping and redistribution
+    for _ in range(5):
+        capped = [False] * len(capitals)
+        for i, row in enumerate(strategies):
+            sid = row.get("strategy_id")
+            cap = None
+            if context and sid in context:
+                cap = float(context[sid].get("max_capital", 0.0) or 0.0)
+            if cap is not None and cap >= 0.0 and capitals[i] > cap:
+                capitals[i] = cap
+                capped[i] = True
+
+        remaining = max(0.0, total_capital - sum(capitals))
+        if remaining <= 1e-9:
+            break
+
+        # redistribute among uncapped
+        uncapped_idx = [i for i, c in enumerate(capped) if not c]
+        if not uncapped_idx:
+            break
+        uncapped_scores = [scores[i] for i in uncapped_idx]
+        sub_weights = _softmax(uncapped_scores, temperature=temperature)
+        for w, i in zip(sub_weights, uncapped_idx):
+            capitals[i] += remaining * w
+
+    return capitals
+
+
 def allocate_capital(
     strategies: List[dict[str, Any]],
     total_capital: float,
@@ -43,7 +82,11 @@ def allocate_capital(
         score = base * mult if enabled else 0.0
         scores.append(score)
 
-    weights = _softmax(scores, temperature=temperature)
+    capitals = _apply_caps(strategies, scores, float(total_capital or 0.0), context, temperature)
+
+    # normalize weights from capitals
+    total = sum(capitals) or 1.0
+    weights = [c / total for c in capitals]
 
     if min_weight > 0:
         weights = [max(min_weight, w) for w in weights]
@@ -51,12 +94,12 @@ def allocate_capital(
         weights = [w / s for w in weights]
 
     allocations = []
-    for row, w in zip(strategies, weights):
+    for row, w, c in zip(strategies, weights, capitals):
         allocations.append(
             {
                 "strategy_id": row.get("strategy_id"),
                 "weight": float(w),
-                "capital": float(total_capital * w),
+                "capital": float(c),
                 "score": _score_row(row),
             }
         )
