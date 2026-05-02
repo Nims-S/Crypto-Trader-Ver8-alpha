@@ -6,11 +6,21 @@ from strategy.state import StrategyState, Signal
 from strategy.indicators import compute_indicators
 
 
+def _htf_confirm(df_htf: pd.DataFrame | None) -> bool:
+    if df_htf is None or len(df_htf) < 200:
+        return True
+    h = df_htf.iloc[-1]
+    return float(h.get("close", 0)) > float(h.get("ema200", 0))
+
+
 def generate(df: pd.DataFrame, symbol: str, state: StrategyState, df_htf: pd.DataFrame | None = None, strategy_override: dict | None = None):
     if df is None or len(df) < 220:
         return None
 
     df = compute_indicators(df) if "atr" not in df.columns else df
+    if df_htf is not None and len(df_htf) > 0 and "atr" not in df_htf.columns:
+        df_htf = compute_indicators(df_htf)
+
     cur = df.iloc[-1]
 
     close = float(cur.get("close", 0))
@@ -24,28 +34,28 @@ def generate(df: pd.DataFrame, symbol: str, state: StrategyState, df_htf: pd.Dat
     if close <= 0 or atr <= 0:
         return None
 
-    # Require squeeze then expansion
+    if not _htf_confirm(df_htf):
+        return None
+
     if bb_rank > 0.40:
         return None
 
     if bb_streak < 3:
         return None
 
-    # Breakout above recent high
     if close <= high20:
         return None
 
-    # Volume expansion
     if vol_sma > 0 and vol < vol_sma * 1.2:
         return None
 
     entry = close
-    stop = entry - (1.8 * atr)
+    stop = entry - (1.7 * atr)
     if stop >= entry:
         return None
 
     risk = entry - stop
-    tp1 = entry + (2.5 * risk)
+    tp1 = entry + (2.1 * risk)
 
     return Signal(
         "LONG",
@@ -53,12 +63,12 @@ def generate(df: pd.DataFrame, symbol: str, state: StrategyState, df_htf: pd.Dat
         stop,
         tp1,
         symbol,
-        "breakout_v3",
+        "breakout_v4",
         "breakout",
-        confidence=0.75,
+        confidence=0.78,
         stop_loss_pct=risk / entry,
         take_profit_pct=(tp1 - entry) / entry,
-        size_multiplier=0.7,
-        cooldown_bars=24,
-        max_bars_override=72,
+        size_multiplier=0.65,
+        cooldown_bars=26,
+        max_bars_override=60,
     )
