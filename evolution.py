@@ -1,6 +1,12 @@
 # legacy compatibility
+from research.scoring import ScoreDecision, score_metrics, promotion_status
+
+# Backward-compatible fallback for older code that expects legacy exports.
 import importlib as _il
-_mod = _il.import_module('legacy.evolution')
-for _k in dir(_mod):
-    if not _k.startswith('_'):
-        globals()[_k] = getattr(_mod, _k)
+try:
+    _legacy = _il.import_module('legacy.evolution')
+    for _k in dir(_legacy):
+        if not _k.startswith('_') and _k not in globals():
+            globals()[_k] = getattr(_legacy, _k)
+except Exception:
+    pass
