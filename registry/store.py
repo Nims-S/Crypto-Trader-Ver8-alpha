@@ -108,7 +108,6 @@ def upsert_strategy(
     store = _load()
     now = _now()
 
-    # Backward-compatible ingestion of extra fields.
     extras = dict(kwargs or {})
     if extras:
         params = dict(parameters or {})
@@ -268,3 +267,32 @@ def list_evolution_runs(strategy_id: str | None = None, limit: int = 100) -> lis
     rows = [r for r in store["evolution_runs"] if strategy_id is None or r.get("child_strategy_id") == strategy_id]
     rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
     return rows[: max(1, int(limit))]
+
+
+def export_trade_history(strategy_id: str | None = None, limit: int = 1000) -> list[dict[str, Any]]:
+    """Return a normalized trade-like history from registry experiments."""
+    rows = list_experiments(strategy_id=strategy_id, limit=max(1, int(limit)))
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        metrics = row.get("metrics") or {}
+        trade = metrics.get("trade") or metrics.get("close_result") or metrics.get("execution") or {}
+        if not isinstance(trade, dict):
+            trade = {}
+        out.append(
+            {
+                "strategy_id": row.get("strategy_id"),
+                "symbol": row.get("symbol"),
+                "timeframe": row.get("timeframe"),
+                "run_type": row.get("run_type"),
+                "created_at": row.get("created_at"),
+                "passed": bool(row.get("passed")),
+                "pnl": float(trade.get("pnl", 0.0) or 0.0),
+                "entry_price": trade.get("entry_price"),
+                "exit_price": trade.get("exit_price"),
+                "qty": trade.get("qty"),
+                "reason": trade.get("reason"),
+                "source": "registry_experiment",
+                "raw": row,
+            }
+        )
+    return out
