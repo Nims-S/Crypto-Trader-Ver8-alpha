@@ -104,11 +104,6 @@ def upsert_strategy(
     parent_strategy_id: str | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Create or update a strategy row.
-
-    **kwargs is accepted for backward compatibility with older callers.
-    Unknown extras are folded into parameters._meta so callers do not crash.
-    """
     with _STORE_LOCK:
         store = _load()
         now = _now()
@@ -262,9 +257,11 @@ def get_strategy(strategy_id: str) -> dict[str, Any]:
     return _row(strategy_id, store["registry"].get(strategy_id))
 
 
-def list_experiments(strategy_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+def list_experiments(strategy_id: str | None = None, limit: int = 100, run_type: str | None = None) -> list[dict[str, Any]]:
     store = _load()
     rows = [e for e in store["experiments"] if strategy_id is None or e.get("strategy_id") == strategy_id]
+    if run_type is not None:
+        rows = [e for e in rows if str(e.get("run_type") or "") == str(run_type)]
     rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
     return rows[: max(1, int(limit))]
 
@@ -276,12 +273,36 @@ def list_evolution_runs(strategy_id: str | None = None, limit: int = 100) -> lis
     return rows[: max(1, int(limit))]
 
 
-def export_trade_history(strategy_id: str | None = None, limit: int = 1000) -> list[dict[str, Any]]:
+def export_trade_history(strategy_id: str | None = None, limit: int = 1000, run_type: str | None = None) -> list[dict[str, Any]]:
     """Return a normalized trade-like history from registry experiments."""
-    rows = list_experiments(strategy_id=strategy_id, limit=max(1, int(limit)))
+    rows = list_experiments(strategy_id=strategy_id, limit=max(1, int(limit)), run_type=run_type)
     out: list[dict[str, Any]] = []
     for row in rows:
         metrics = row.get("metrics") or {}
+        detail = metrics.get("trades_detail")
+        if isinstance(detail, list) and detail:
+            for t in detail:
+                if not isinstance(t, dict):
+                    continue
+                out.append(
+                    {
+                        "strategy_id": row.get("strategy_id"),
+                        "symbol": row.get("symbol"),
+                        "timeframe": row.get("timeframe"),
+                        "run_type": row.get("run_type"),
+                        "created_at": row.get("created_at"),
+                        "passed": bool(row.get("passed")),
+                        "pnl": float(t.get("pnl", 0.0) or 0.0),
+                        "entry_price": t.get("entry_price"),
+                        "exit_price": t.get("exit_price"),
+                        "qty": t.get("qty"),
+                        "reason": t.get("reason"),
+                        "source": "registry_experiment",
+                        "raw": t,
+                    }
+                )
+            continue
+
         trade = metrics.get("trade") or metrics.get("close_result") or metrics.get("execution") or {}
         if not isinstance(trade, dict):
             trade = {}
