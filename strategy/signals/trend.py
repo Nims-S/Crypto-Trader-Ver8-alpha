@@ -16,11 +16,27 @@ def _recent_cross_above(series_a: pd.Series, series_b: pd.Series, lookback: int 
     return bool((prev & now).any())
 
 
+def _htf_confirm(df_htf: pd.DataFrame | None) -> bool:
+    if df_htf is None or len(df_htf) < 220:
+        return True
+    h = df_htf.iloc[-1]
+    close = float(h.get("close", 0))
+    ema20 = float(h.get("ema20", 0))
+    ema50 = float(h.get("ema50", 0))
+    ema200 = float(h.get("ema200", 0))
+    adx = float(h.get("adx", 0))
+    bb_rank = float(h.get("bb_width_rank", 0))
+    return bool(close > ema200 and ema20 > ema50 > ema200 and adx >= 18.0 and bb_rank >= 0.30)
+
+
 def generate(df: pd.DataFrame, symbol: str, state: StrategyState, df_htf: pd.DataFrame | None = None, strategy_override: dict | None = None):
     if df is None or len(df) < 260:
         return None
 
     df = compute_indicators(df) if "atr" not in df.columns else df
+    if df_htf is not None and len(df_htf) > 0 and "atr" not in df_htf.columns:
+        df_htf = compute_indicators(df_htf)
+
     cur = df.iloc[-1]
     prev = df.iloc[-2]
 
@@ -41,16 +57,18 @@ def generate(df: pd.DataFrame, symbol: str, state: StrategyState, df_htf: pd.Dat
     if not (close > ema200 and ema20 > ema50 > ema200):
         return None
 
-    if adx < max(state.min_adx + 4.0, 22.0):
+    if not _htf_confirm(df_htf):
         return None
 
-    if bb_rank < 0.35 or atr_rank < 0.30:
+    if adx < max(state.min_adx + 5.0, 23.0):
         return None
 
-    if rsi < 50.0 or rsi > 72.0:
+    if bb_rank < 0.38 or atr_rank < 0.32:
         return None
 
-    # Require a fresh pullback/reclaim to reduce overtrading.
+    if rsi < 52.0 or rsi > 70.0:
+        return None
+
     had_pullback = bool(
         prev.get("close", 0) <= prev.get("ema20", 0)
         or prev.get("low", 0) <= prev.get("ema20", 0)
@@ -59,7 +77,7 @@ def generate(df: pd.DataFrame, symbol: str, state: StrategyState, df_htf: pd.Dat
     if not had_pullback:
         return None
 
-    if vol_sma > 0 and vol < vol_sma * 1.05:
+    if vol_sma > 0 and vol < vol_sma * 1.08:
         return None
 
     entry = close
@@ -67,13 +85,13 @@ def generate(df: pd.DataFrame, symbol: str, state: StrategyState, df_htf: pd.Dat
     if entry <= 0 or atr <= 0:
         return None
 
-    stop = entry - (2.1 * atr)
+    stop = entry - (2.0 * atr)
     if stop >= entry:
         return None
 
     risk = entry - stop
-    tp1 = entry + (2.8 * risk)
-    tp2 = entry + (4.8 * risk)
+    tp1 = entry + (2.3 * risk)
+    tp2 = entry + (4.0 * risk)
 
     return Signal(
         "LONG",
@@ -81,15 +99,15 @@ def generate(df: pd.DataFrame, symbol: str, state: StrategyState, df_htf: pd.Dat
         stop,
         tp1,
         symbol,
-        "trend_following_v3",
+        "trend_following_v4",
         "trend",
-        confidence=0.82,
+        confidence=0.84,
         stop_loss_pct=risk / entry,
         take_profit_pct=(tp1 - entry) / entry,
         secondary_take_profit_pct=(tp2 - entry) / entry,
-        tp1_close_fraction=0.35,
-        tp2_close_fraction=0.65,
-        size_multiplier=0.85,
-        cooldown_bars=24,
-        max_bars_override=96,
+        tp1_close_fraction=0.50,
+        tp2_close_fraction=0.50,
+        size_multiplier=0.80,
+        cooldown_bars=30,
+        max_bars_override=84,
     )
