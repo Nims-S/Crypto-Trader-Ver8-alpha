@@ -98,19 +98,39 @@ def _evaluate_candidate(cfg: AgentConfig, candidate, parent_id: str | None, iter
     params = dict(candidate.parameters or {})
     bt = run_backtest(cfg.symbol, cfg.timeframe, cfg.start, cfg.end, strategy_override={"parameters": params})
     if "error" in bt:
-        return {
-            "candidate": candidate,
-            "score": -1e9,
-            "passed": False,
-            "backtest": bt,
-            "walk_forward": {"passed": False, "score": 0.0, "reasons": [bt["error"]]},
-            "monte_carlo": {"error": bt["error"]},
-        }
+        wf = {"passed": False, "score": 0.0, "reasons": [bt["error"]]}
+        mc = {"error": bt["error"]}
+        score = -1e9
+        passed = False
+    else:
+        wf = _eval_walk_forward(cfg, params)
+        mc = run_monte_carlo_from_summary(bt)
+        score = _objective(bt, wf, mc)
+        passed = _passes(bt, wf, mc, cfg)
 
-    wf = _eval_walk_forward(cfg, params)
-    mc = run_monte_carlo_from_summary(bt)
-    score = _objective(bt, wf, mc)
-    passed = _passes(bt, wf, mc, cfg)
+    return {
+        "candidate": candidate,
+        "score": score,
+        "passed": passed,
+        "backtest": bt,
+        "walk_forward": wf,
+        "monte_carlo": mc,
+        "parent_id": parent_id,
+        "iteration": iteration,
+        "parameters": params,
+    }
+
+
+def _persist_candidate(result: dict[str, Any], cfg: AgentConfig) -> None:
+    candidate = result["candidate"]
+    bt = result["backtest"]
+    wf = result["walk_forward"]
+    mc = result["monte_carlo"]
+    score = float(result["score"])
+    passed = bool(result["passed"])
+    parent_id = result["parent_id"]
+    iteration = int(result["iteration"])
+    params = dict(result["parameters"] or {})
 
     record_evolution_run(
         cycle_id=f"iter_{iteration}",
@@ -141,15 +161,6 @@ def _evaluate_candidate(cfg: AgentConfig, candidate, parent_id: str | None, iter
         parent_strategy_id=parent_id,
     )
 
-    return {
-        "candidate": candidate,
-        "score": score,
-        "passed": passed,
-        "backtest": bt,
-        "walk_forward": wf,
-        "monte_carlo": mc,
-    }
-
 
 def run_agent(cfg: AgentConfig):
     ranked = rank_strategies(symbol=cfg.symbol, timeframe=cfg.timeframe, limit=1)
@@ -164,6 +175,9 @@ def run_agent(cfg: AgentConfig):
 
         with cf.ThreadPoolExecutor(max_workers=max(1, int(cfg.workers))) as pool:
             results = list(pool.map(lambda cand: _evaluate_candidate(cfg, cand, parent.get("strategy_id"), iteration), children))
+
+        for result in results:
+            _persist_candidate(result, cfg)
 
         best = max(results, key=lambda x: x["score"])
         parent = _as_parent(best["candidate"])
