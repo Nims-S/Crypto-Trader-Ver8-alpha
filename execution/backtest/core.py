@@ -10,7 +10,12 @@ from typing import Any
 import ccxt
 import numpy as np
 import pandas as pd
+import sys
+from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 from registry.store import record_experiment, upsert_strategy
 from research.scoring import score_metrics, promotion_status
 from strategy import StrategyState, compute_indicators, generate_signal
