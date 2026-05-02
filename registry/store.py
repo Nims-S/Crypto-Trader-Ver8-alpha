@@ -5,11 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List
 
 _STORE_PATH = Path(os.getenv("STRATEGY_STORE_FILE", ".strategy_store.json"))
+_STORE_LOCK = threading.RLock()
 
 
 def _now() -> str:
@@ -40,10 +43,11 @@ def _load() -> dict[str, Any]:
 
 
 def _save(store: dict[str, Any]) -> None:
-    tmp = _STORE_PATH.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(store, fh, indent=2, sort_keys=True, default=str)
-    tmp.replace(_STORE_PATH)
+    with _STORE_LOCK:
+        tmp = _STORE_PATH.with_name(f"{_STORE_PATH.stem}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(store, fh, indent=2, sort_keys=True, default=str)
+        os.replace(tmp, _STORE_PATH)
 
 
 def _jsonable(value: Any) -> Any:
@@ -105,39 +109,40 @@ def upsert_strategy(
     **kwargs is accepted for backward compatibility with older callers.
     Unknown extras are folded into parameters._meta so callers do not crash.
     """
-    store = _load()
-    now = _now()
+    with _STORE_LOCK:
+        store = _load()
+        now = _now()
 
-    extras = dict(kwargs or {})
-    if extras:
-        params = dict(parameters or {})
-        meta = dict(params.get("_meta") or {})
-        meta.update({str(k): _jsonable(v) for k, v in extras.items()})
-        params["_meta"] = meta
-        parameters = params
+        extras = dict(kwargs or {})
+        if extras:
+            params = dict(parameters or {})
+            meta = dict(params.get("_meta") or {})
+            meta.update({str(k): _jsonable(v) for k, v in extras.items()})
+            params["_meta"] = meta
+            parameters = params
 
-    logic_hash = compute_logic_hash(parameters)
-    row = {
-        "base_strategy": base_strategy,
-        "version": int(version or 1),
-        "status": status,
-        "parameters": _jsonable(parameters or {}),
-        "metrics": _jsonable(metrics or {}),
-        "tags": _jsonable(tags or []),
-        "source": source,
-        "notes": notes,
-        "active": bool(active),
-        "logic_hash": logic_hash,
-        "regime_profile": regime_profile,
-        "robustness_score": float(robustness_score or 0.0),
-        "parent_strategy_id": parent_strategy_id,
-        "created_at": store["registry"].get(strategy_id, {}).get("created_at", now),
-        "updated_at": now,
-        "validated_at": validated_at.isoformat() if hasattr(validated_at, "isoformat") else validated_at,
-    }
-    store["registry"][strategy_id] = row
-    _save(store)
-    return _row(strategy_id, row)
+        logic_hash = compute_logic_hash(parameters)
+        row = {
+            "base_strategy": base_strategy,
+            "version": int(version or 1),
+            "status": status,
+            "parameters": _jsonable(parameters or {}),
+            "metrics": _jsonable(metrics or {}),
+            "tags": _jsonable(tags or []),
+            "source": source,
+            "notes": notes,
+            "active": bool(active),
+            "logic_hash": logic_hash,
+            "regime_profile": regime_profile,
+            "robustness_score": float(robustness_score or 0.0),
+            "parent_strategy_id": parent_strategy_id,
+            "created_at": store["registry"].get(strategy_id, {}).get("created_at", now),
+            "updated_at": now,
+            "validated_at": validated_at.isoformat() if hasattr(validated_at, "isoformat") else validated_at,
+        }
+        store["registry"][strategy_id] = row
+        _save(store)
+        return _row(strategy_id, row)
 
 
 def record_experiment(
@@ -151,23 +156,24 @@ def record_experiment(
     passed: bool = False,
     notes: str = "",
 ) -> dict[str, Any]:
-    store = _load()
-    store["counters"]["experiment_id"] = int(store["counters"].get("experiment_id", 0)) + 1
-    row = {
-        "id": store["counters"]["experiment_id"],
-        "strategy_id": strategy_id,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "run_type": run_type,
-        "parameters": _jsonable(parameters or {}),
-        "metrics": _jsonable(metrics or {}),
-        "passed": bool(passed),
-        "notes": notes,
-        "created_at": _now(),
-    }
-    store["experiments"].append(row)
-    _save(store)
-    return row
+    with _STORE_LOCK:
+        store = _load()
+        store["counters"]["experiment_id"] = int(store["counters"].get("experiment_id", 0)) + 1
+        row = {
+            "id": store["counters"]["experiment_id"],
+            "strategy_id": strategy_id,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "run_type": run_type,
+            "parameters": _jsonable(parameters or {}),
+            "metrics": _jsonable(metrics or {}),
+            "passed": bool(passed),
+            "notes": notes,
+            "created_at": _now(),
+        }
+        store["experiments"].append(row)
+        _save(store)
+        return row
 
 
 def record_evolution_run(
@@ -184,26 +190,27 @@ def record_evolution_run(
     metrics: dict[str, Any] | None = None,
     notes: str = "",
 ) -> dict[str, Any]:
-    store = _load()
-    store["counters"]["evolution_id"] = int(store["counters"].get("evolution_id", 0)) + 1
-    row = {
-        "id": store["counters"]["evolution_id"],
-        "cycle_id": cycle_id,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "parent_strategy_id": parent_strategy_id,
-        "child_strategy_id": child_strategy_id,
-        "status": status,
-        "score": float(score),
-        "passed": bool(passed),
-        "parameters": _jsonable(parameters or {}),
-        "metrics": _jsonable(metrics or {}),
-        "notes": notes,
-        "created_at": _now(),
-    }
-    store["evolution_runs"].append(row)
-    _save(store)
-    return row
+    with _STORE_LOCK:
+        store = _load()
+        store["counters"]["evolution_id"] = int(store["counters"].get("evolution_id", 0)) + 1
+        row = {
+            "id": store["counters"]["evolution_id"],
+            "cycle_id": cycle_id,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "parent_strategy_id": parent_strategy_id,
+            "child_strategy_id": child_strategy_id,
+            "status": status,
+            "score": float(score),
+            "passed": bool(passed),
+            "parameters": _jsonable(parameters or {}),
+            "metrics": _jsonable(metrics or {}),
+            "notes": notes,
+            "created_at": _now(),
+        }
+        store["evolution_runs"].append(row)
+        _save(store)
+        return row
 
 
 def list_strategies(active_only: bool = False) -> list[dict[str, Any]]:
