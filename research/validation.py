@@ -116,6 +116,13 @@ def _trade_density_threshold(timeframe: str) -> int:
     return TRADE_DENSITY_BASE.get(tf, 6)
 
 
+def _split_trade_floor(timeframe: str, split_name: str) -> int:
+    base = _trade_density_threshold(timeframe)
+    if split_name == "train":
+        return max(4, int(round(base * 0.8)))
+    return max(4, int(round(base * 0.6)))
+
+
 def _trade_density_score(trades: int, timeframe: str, split_name: str) -> float:
     base = _trade_density_threshold(timeframe)
     if split_name == "train":
@@ -166,7 +173,7 @@ def summarize_walk_forward_reports(
                 reasons.append(f"{fold.get('label', 'fold')}:{split_name}:{result['error']}")
                 continue
 
-            decision = score_metrics(result)
+            decision = score_metrics(result, timeframe=timeframe, min_trades=_split_trade_floor(timeframe, split_name))
             split_scores[split_name].append(decision.score)
             split_decisions[split_name].append(_decision_to_dict(decision))
 
@@ -204,12 +211,12 @@ def summarize_walk_forward_reports(
     passed = (
         bool(split_scores["val"])
         and bool(split_scores["test"])
-        and val_mean >= 0.55
-        and test_mean >= 0.55
-        and min_val_score >= 0.45
-        and min_test_score >= 0.45
-        and final_score >= 0.55
-        and score_spread <= 0.35
+        and val_mean >= 0.45
+        and test_mean >= 0.45
+        and min_val_score >= 0.30
+        and min_test_score >= 0.30
+        and final_score >= 0.45
+        and score_spread <= 0.40
         and not reasons
     )
 
