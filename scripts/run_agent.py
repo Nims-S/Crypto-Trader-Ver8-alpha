@@ -9,7 +9,7 @@ if __name__ == "__main__":
     p.add_argument("--timeframe", default="1h")
     p.add_argument("--start", default="2022-01-02")
     p.add_argument("--end", default="2026-12-31")
-    p.add_argument("--goal-return", type=float, default=30.0)
+    p.add_argument("--goal-return", type=float, default=0.25)
     p.add_argument("--max-dd", type=float, default=15.0)
     p.add_argument("--iterations", type=int, default=100)
     p.add_argument("--candidates", type=int, default=5)
