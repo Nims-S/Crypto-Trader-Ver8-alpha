@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -189,16 +188,18 @@ def _close_leg(trades: list[dict[str, Any]], pos: Position, exit_price: float, q
         pnl = (exit_price - pos.entry) * qty - _fee(exit_price, qty, MAKER_FEE_BPS)
     else:
         pnl = (pos.entry - exit_price) * qty - _fee(exit_price, qty, MAKER_FEE_BPS)
-    trades.append({
-        "ts": pos.open_ts,
-        "strategy": pos.strategy,
-        "side": pos.side,
-        "entry_price": round(pos.entry, 6),
-        "exit_price": round(exit_price, 6),
-        "qty": round(qty, 8),
-        "pnl": round(pnl, 6),
-        "result": result,
-    })
+    trades.append(
+        {
+            "ts": pos.open_ts,
+            "strategy": pos.strategy,
+            "side": pos.side,
+            "entry_price": round(pos.entry, 6),
+            "exit_price": round(exit_price, 6),
+            "qty": round(qty, 8),
+            "pnl": round(pnl, 6),
+            "result": result,
+        }
+    )
     pos.qty -= qty
     return trades, pnl
 
@@ -268,7 +269,6 @@ def run_backtest(
     params = (strategy_override or {}).get("parameters") or strategy_override or {}
     params = dict(params or {})
 
-    # apply a few common overrides to the state when present
     if params:
         state.allow_shorts = bool(params.get("allow_shorts", state.allow_shorts))
         state.min_adx = float(params.get("min_adx", state.min_adx))
@@ -289,8 +289,9 @@ def run_backtest(
             pos.bars += 1
             if pos.bars >= pos.max_bars:
                 exit_px = _slip(close, atr, close, pos.side)
-                trades, _ = _close_leg(trades, pos, exit_px, pos.qty, "MAX_BARS")
-                cash += _fee(exit_px, pos.qty, TAKER_FEE_BPS)
+                closed_qty = pos.qty
+                trades, _ = _close_leg(trades, pos, exit_px, closed_qty, "MAX_BARS")
+                cash += exit_px * closed_qty - _fee(exit_px, closed_qty, TAKER_FEE_BPS)
                 pos = None
                 cooldown_until = i + 1
                 equity_curve.append(cash)
@@ -307,8 +308,9 @@ def run_backtest(
 
             if sl_hit:
                 exit_px = _slip(pos.stop, atr, close, pos.side)
-                trades, _ = _close_leg(trades, pos, exit_px, pos.qty, "SL")
-                cash += _fee(exit_px, pos.qty, TAKER_FEE_BPS)
+                closed_qty = pos.qty
+                trades, _ = _close_leg(trades, pos, exit_px, closed_qty, "SL")
+                cash += exit_px * closed_qty - _fee(exit_px, closed_qty, TAKER_FEE_BPS)
                 pos = None
                 cooldown_until = i + 1
                 equity_curve.append(cash)
@@ -316,15 +318,17 @@ def run_backtest(
 
             if pos and not pos.tp1_hit and tp1_hit:
                 exit_px = _slip(pos.tp1, atr, close, pos.side)
-                trades, _ = _close_leg(trades, pos, exit_px, pos.tp1_qty, "TP1")
-                cash += _fee(exit_px, pos.tp1_qty, TAKER_FEE_BPS)
+                closed_qty = pos.tp1_qty
+                trades, _ = _close_leg(trades, pos, exit_px, closed_qty, "TP1")
+                cash += exit_px * closed_qty - _fee(exit_px, closed_qty, TAKER_FEE_BPS)
                 pos.tp1_hit = True
                 pos.stop = pos.entry
 
             if pos and pos.tp1_hit and tp2_hit:
                 exit_px = _slip(pos.tp2, atr, close, pos.side)
-                trades, _ = _close_leg(trades, pos, exit_px, pos.qty, "TP2")
-                cash += _fee(exit_px, pos.qty, TAKER_FEE_BPS)
+                closed_qty = pos.qty
+                trades, _ = _close_leg(trades, pos, exit_px, closed_qty, "TP2")
+                cash += exit_px * closed_qty - _fee(exit_px, closed_qty, TAKER_FEE_BPS)
                 pos = None
                 cooldown_until = i + 1
                 equity_curve.append(cash)
@@ -389,8 +393,9 @@ def run_backtest(
         last_close = _safe_float(last.get("close", 0.0), 0.0)
         last_atr = _safe_float(last.get("atr", 0.0), 0.0)
         exit_px = _slip(last_close, last_atr, last_close, pos.side)
-        trades, _ = _close_leg(trades, pos, exit_px, pos.qty, "EOD_CLOSE")
-        cash += _fee(exit_px, pos.qty, TAKER_FEE_BPS)
+        closed_qty = pos.qty
+        trades, _ = _close_leg(trades, pos, exit_px, closed_qty, "EOD_CLOSE")
+        cash += exit_px * closed_qty - _fee(exit_px, closed_qty, TAKER_FEE_BPS)
         pos = None
 
     metrics = _compute_metrics(trades, equity_curve, 10_000.0)
