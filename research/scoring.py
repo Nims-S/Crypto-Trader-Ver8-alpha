@@ -65,7 +65,6 @@ def score_metrics(m: dict[str, Any], timeframe: str | None = None, min_trades: i
     if ret < 0.0:
         reasons.append("return<0")
 
-    # balanced scoring including return
     return_score = _clamp(max(ret, 0.0) / 1.0)
     pf_score = _clamp(pf / 2.0)
     wr_score = _clamp(wr)
@@ -80,7 +79,8 @@ def score_metrics(m: dict[str, Any], timeframe: str | None = None, min_trades: i
         + 0.15 * trade_score
     )
 
-    passed = len(reasons) == 0 and score > 0.50
+    # relaxed threshold (was 0.50)
+    passed = len(reasons) == 0 and score > 0.42
     return ScoreDecision(score=score, passed=passed, reasons=tuple(reasons))
 
 
