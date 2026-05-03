@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from research.prompt_templates import build_prompt_bundle
+
 DEFAULT_STORE_PATH = Path(".strategy_store.json")
 
 
@@ -338,4 +340,16 @@ def build_feedback_summary(
         timeframe=timeframe,
     )
     feedback["mutation_directives"] = derive_mutation_directives(feedback)
+
+    # Build compact prompt bundle for LLM-driven evolution (fast, minimal context)
+    prompt_context = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "failure_profile": feedback.get("failure_profile"),
+        "trade_activity": feedback.get("trade_activity"),
+        "score_spread": feedback.get("score_spread"),
+        "mutation_directives": feedback.get("mutation_directives"),
+    }
+    feedback["prompt_bundle"] = build_prompt_bundle(prompt_context)
+
     return feedback
