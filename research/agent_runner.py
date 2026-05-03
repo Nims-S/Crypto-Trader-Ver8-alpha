@@ -22,7 +22,7 @@ class AgentConfig:
     timeframe: str
     start: str
     end: str
-    goal_return: float = 30.0
+    goal_return: float = 0.25
     max_dd: float = 15.0
     iterations: int = 100
     candidates: int = 5
@@ -142,7 +142,13 @@ def _evaluate_candidate(candidate: StrategyCandidate, cfg: AgentConfig, iteratio
 
     wf = summarize_walk_forward_reports(fold_reports, timeframe=cfg.timeframe)
     mc = _run_monte_carlo(bt.get("trades_detail", []), seed=iteration)
-    score = score_candidate(bt, wf, mc, goal_return_pct=cfg.goal_return, max_drawdown_pct=cfg.max_dd)
+    score = score_candidate(
+        bt,
+        wf,
+        mc,
+        goal_return_pct=cfg.goal_return,
+        max_drawdown_pct=cfg.max_dd,
+    )
 
     return CandidateResult(candidate=candidate, backtest=bt, walk_forward=wf, monte_carlo=mc, score=score, parent_id=parent_id, iteration=iteration)
 
@@ -231,10 +237,12 @@ def run_agent(cfg: AgentConfig) -> dict[str, Any]:
                 "best_strategy": best.candidate.strategy_id,
                 "score": best.score.score,
                 "passed": best.score.passed,
+                "reasons": best.score.reasons,
                 "return_pct": best.backtest.get("return_pct"),
                 "max_dd": best.backtest.get("max_drawdown_pct"),
                 "pf": best.backtest.get("profit_factor"),
                 "wr": best.backtest.get("win_rate"),
+                "wf_passed": best.walk_forward.get("passed"),
             }
         )
 
