@@ -7,11 +7,13 @@ from typing import Any
 
 import pandas as pd
 
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from execution.backtest.core import run_backtest
 from research.candidate_generator import mutate_parent, seed_strategy
-from research.monte_carlo import run_monte_carlo_from_summary
 from research.validation import build_walk_forward_folds, summarize_walk_forward_reports
-from registry.store import rank_strategies, record_evolution_run, upsert_strategy
+from research.agent_scoring import score_candidate
 
 
 @dataclass(frozen=True)
@@ -94,30 +96,29 @@ def _objective(bt: dict[str, Any], wf: dict[str, Any], mc: dict[str, Any]) -> fl
     )
 
 
-def _evaluate_candidate(cfg: AgentConfig, candidate, parent_id: str | None, iteration: int) -> dict[str, Any]:
-    params = dict(candidate.parameters or {})
-    bt = run_backtest(cfg.symbol, cfg.timeframe, cfg.start, cfg.end, strategy_override={"parameters": params})
-    if "error" in bt:
-        wf = {"passed": False, "score": 0.0, "reasons": [bt["error"]]}
-        mc = {"error": bt["error"]}
-        score = -1e9
-        passed = False
-    else:
-        wf = _eval_walk_forward(cfg, params)
-        mc = run_monte_carlo_from_summary(bt)
-        score = _objective(bt, wf, mc)
-        passed = _passes(bt, wf, mc, cfg)
+def eval_candidate(c, symbol, tf, start, end, goal_return, max_dd):
+    bt = run_backtest(symbol, tf, start, end, strategy_override=c.parameters)
+
+    folds = build_walk_forward_folds(start, end, folds=3)
+    reports = []
+
+    for f in folds:
+        sub = {
+            "train": run_backtest(symbol, tf, f.start, f.end, strategy_override=c.parameters),
+            "val": run_backtest(symbol, tf, f.start, f.end, strategy_override=c.parameters),
+            "test": run_backtest(symbol, tf, f.start, f.end, strategy_override=c.parameters),
+        }
+        reports.append(sub)
+
+    wf = summarize_walk_forward_reports(reports, timeframe=tf)
+    mc = run_monte_carlo(bt.get("trades_detail", []))
+
+    score = score_candidate(bt, wf, mc, goal_return, max_dd)
 
     return {
-        "candidate": candidate,
+        "candidate": c,
         "score": score,
-        "passed": passed,
-        "backtest": bt,
-        "walk_forward": wf,
-        "monte_carlo": mc,
-        "parent_id": parent_id,
-        "iteration": iteration,
-        "parameters": params,
+        "bt": bt
     }
 
 
@@ -162,47 +163,60 @@ def _persist_candidate(result: dict[str, Any], cfg: AgentConfig) -> None:
     )
 
 
-def run_agent(cfg: AgentConfig):
-    ranked = rank_strategies(symbol=cfg.symbol, timeframe=cfg.timeframe, limit=1)
-    parent = _as_parent(ranked[0] if ranked else seed_strategy(cfg.symbol, cfg.timeframe))
+def run_agent(symbol, tf, start, end, iterations=50, candidates=5, workers=1):
+    parent = seed_strategy(symbol, tf)
 
-    best_score = float("-inf")
-    iteration = 0
+    for i in range(iterations):
+        children = mutate_parent(parent, symbol, tf, n_children=candidates)
 
-    while True:
-        iteration += 1
-        children = mutate_parent(parent, cfg.symbol, cfg.timeframe, n_children=cfg.candidates)
+        results = []
 
-        with cf.ThreadPoolExecutor(max_workers=max(1, int(cfg.workers))) as pool:
-            results = list(pool.map(lambda cand: _evaluate_candidate(cfg, cand, parent.get("strategy_id"), iteration), children))
+        if workers > 1:
+            with ThreadPoolExecutor(workers) as ex:
+                futures = [
+                    ex.submit(eval_candidate, c, symbol, tf, start, end, 30, 15)
+                    for c in children
+                ]
+                for f in as_completed(futures):
+                    results.append(f.result())
+        else:
+            for c in children:
+                results.append(eval_candidate(c, symbol, tf, start, end, 30, 15))
 
-        for result in results:
-            _persist_candidate(result, cfg)
+        best = max(results, key=lambda x: x["score"].score)
 
-        best = max(results, key=lambda x: x["score"])
-        parent = _as_parent(best["candidate"])
+        print({
+            "iter": i + 1,
+            "score": best["score"].score,
+            "passed": best["score"].passed,
+            "return": best["bt"].get("return_pct"),
+            "dd": best["bt"].get("max_drawdown_pct"),
+        })
 
-        if best["score"] > best_score:
-            best_score = best["score"]
+        parent = best["candidate"]
 
-        print(
-            {
-                "iteration": iteration,
-                "best_strategy": best["candidate"].strategy_id,
-                "score": round(float(best["score"]), 6),
-                "passed": bool(best["passed"]),
-                "return_pct": best["backtest"].get("return_pct"),
-                "max_dd": best["backtest"].get("max_drawdown_pct"),
-                "pf": best["backtest"].get("profit_factor"),
-                "wr": best["backtest"].get("win_rate"),
-            }
-        )
-
-        if best["passed"]:
-            print("TARGET ACHIEVED")
-            return
-
-        if not cfg.continuous and iteration >= cfg.iterations:
+        if best["score"].passed:
+            print("🎯 TARGET ACHIEVED")
             break
 
-        time.sleep(max(0.1, float(cfg.sleep_seconds)))
+def run_monte_carlo(trades, sims=200):
+    if not trades:
+        return {"worst_drawdown_pct": 100}
+
+    pnls = [t["pnl"] for t in trades]
+    results = []
+
+    for _ in range(sims):
+        eq = 10000
+        peak = eq
+        worst_dd = 0
+
+        for _ in pnls:
+            eq += random.choice(pnls)
+            peak = max(peak, eq)
+            dd = (eq - peak) / peak * 100
+            worst_dd = min(worst_dd, dd)
+
+        results.append(worst_dd)
+
+    return {"worst_drawdown_pct": abs(min(results))}
