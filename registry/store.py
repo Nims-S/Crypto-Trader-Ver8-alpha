@@ -241,9 +241,13 @@ def rank_strategies(
 
     def _score(r):
         m = r.get("metrics") or {}
-        decision = m.get("decision") or {}
+        agent = m.get("agent_score") or {}
+        wf = m.get("walk_forward") or {}
+        bt = m.get("backtest") or {}
         return (
-            float(decision.get("score", 0.0)),
+            float(agent.get("score", 0.0)),
+            float(wf.get("score", 0.0)),
+            float(bt.get("return_pct", 0.0)),
             float(r.get("robustness_score", 0.0)),
             r.get("updated_at") or "",
         )
