@@ -36,7 +36,6 @@ def _jsonish_lines(items: list[tuple[str, Any]]) -> str:
 
 
 def build_hermes_prompt(context: dict[str, Any]) -> str:
-    """Return a compact hypothesis-generation prompt."""
     symbol = str(context.get("symbol") or "BTC/USDT")
     timeframe = str(context.get("timeframe") or "1h")
     failure = context.get("failure_profile") or {}
@@ -62,78 +61,58 @@ def build_hermes_prompt(context: dict[str, Any]) -> str:
     )
 
     return (
-        "You are Hermes. Output 3 hypothesis packets as strict JSON only. "
-        "No prose. Keep each packet distinct. Prefer speed over explanation.\n"
-        f"Context: {payload}\n"
-        "Rules: target one regime each; declare failure modes; declare the exact metric improved; "
-        "include entry_ideas, exit_ideas, volatility_adaptation, trade_density_expectation, robustness_checks, gating_rules. "
-        "At least one packet must favor density, one stability, one drawdown."
+        "You are Hermes. Output 3 hypothesis packets as strict JSON only. No prose.\n"
+        f"Context: {payload}"
     )
 
 
 def build_claude_prompt(context: dict[str, Any]) -> str:
-    """Return a compact strategy-mutation prompt."""
     symbol = str(context.get("symbol") or "BTC/USDT")
     timeframe = str(context.get("timeframe") or "1h")
     parent_id = str(context.get("parent_strategy_id") or "seed")
-    hypothesis = context.get("hypothesis_packet") or {}
-    backtest = context.get("backtest") or {}
-    walk_forward = context.get("walk_forward") or {}
-    directives = context.get("mutation_directives") or {}
 
     payload = _jsonish_lines(
         [
             ("parent_strategy_id", parent_id),
             ("symbol", symbol),
             ("timeframe", timeframe),
-            ("hypothesis", hypothesis),
-            ("backtest", {
-                "return_pct": _safe_float(backtest.get("return_pct", 0.0)),
-                "pf": _safe_float(backtest.get("profit_factor", 0.0)),
-                "wr": _safe_float(backtest.get("win_rate", 0.0)),
-                "dd": _safe_float(backtest.get("max_drawdown_pct", 0.0)),
-                "trades": _safe_int(backtest.get("trades", 0)),
-            }),
-            ("wf", {
-                "score": _safe_float(walk_forward.get("score", 0.0)),
-                "passed": bool(walk_forward.get("passed", False)),
-                "spread": _safe_float(walk_forward.get("score_spread", 0.0)),
-            }),
-            ("directives", directives),
+            ("directives", context.get("mutation_directives") or {}),
         ]
     )
 
     return (
-        "You are Claude Code. Mutate the parent strategy into 3 child variants. JSON only. "
-        "Keep changes minimal, fast, and traceable.\n"
-        f"Context: {payload}\n"
-        "Hard rules: no new framework, no unrelated indicators, no broken risk control, no overfit hacks. "
-        "Return 3 children; one density-focused, one stability-focused, one drawdown-focused."
-    )
-
-
-def build_validator_prompt(context: dict[str, Any]) -> str:
-    """Return a compact deployability-check prompt."""
-    symbol = str(context.get("symbol") or "BTC/USDT")
-    timeframe = str(context.get("timeframe") or "1h")
-    metrics = context.get("metrics") or {}
-    payload = _jsonish_lines(
-        [
-            ("symbol", symbol),
-            ("timeframe", timeframe),
-            ("metrics", metrics),
-        ]
-    )
-
-    return (
-        "You are a validator. Decide candidate|validated|paper|live|rejected. JSON only. "
-        "Prioritize robustness, density, drawdown, then return.\n"
+        "Mutate strategy. Return JSON with parameter_updates only. No prose.\n"
         f"Context: {payload}"
     )
 
 
+def build_child_batch_prompts(context: dict[str, Any], n: int = 3) -> list[dict[str, str]]:
+    """Create diverse prompts for parallel mutation."""
+    goals = ["density", "stability", "drawdown"]
+    outputs = []
+    for i in range(max(1, n)):
+        goal = goals[i % len(goals)]
+        prompt = (
+            f"Mutate trading strategy focusing on {goal}. Return JSON: {{'parameter_updates':{{...}}}} only. "
+            f"Context: {context}"
+        )
+        outputs.append({"goal": goal, "prompt": prompt})
+    return outputs
+
+
+def build_validator_prompt(context: dict[str, Any]) -> str:
+    payload = _jsonish_lines(
+        [
+            ("symbol", context.get("symbol")),
+            ("timeframe", context.get("timeframe")),
+            ("metrics", context.get("metrics") or {}),
+        ]
+    )
+
+    return f"Validate strategy JSON only. Context: {payload}"
+
+
 def build_prompt_bundle(context: dict[str, Any]) -> dict[str, str]:
-    """Return all prompt variants used by the research loop."""
     return {
         "hermes": build_hermes_prompt(context),
         "claude": build_claude_prompt(context),
