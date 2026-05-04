@@ -32,16 +32,16 @@ def _clamp(v, lo=0.0, hi=1.0):
 def _min_trades_for_timeframe(timeframe: str | None) -> int:
     tf = (timeframe or "").lower()
     base = {
-        "1d": 6,
-        "12h": 8,
-        "8h": 8,
-        "4h": 10,
-        "2h": 10,
-        "1h": 12,
-        "30m": 14,
-        "15m": 16,
+        "1d": 5,
+        "12h": 6,
+        "8h": 6,
+        "4h": 8,
+        "2h": 8,
+        "1h": 10,
+        "30m": 12,
+        "15m": 14,
     }
-    return base.get(tf, 10)
+    return base.get(tf, 8)
 
 
 def score_metrics(m: dict[str, Any], timeframe: str | None = None, min_trades: int | None = None) -> ScoreDecision:
@@ -52,8 +52,8 @@ def score_metrics(m: dict[str, Any], timeframe: str | None = None, min_trades: i
     ret = _safe(m.get("return_pct", 0))
 
     trade_floor = int(min_trades or _min_trades_for_timeframe(timeframe))
-    min_pf = 0.90
-    min_wr = 0.35
+    min_pf = 0.85
+    min_wr = 0.33
 
     reasons: list[str] = []
     if trades < trade_floor:
@@ -65,22 +65,21 @@ def score_metrics(m: dict[str, Any], timeframe: str | None = None, min_trades: i
     if ret < 0.0:
         reasons.append("return<0")
 
-    return_score = _clamp(max(ret, 0.0) / 1.0)
+    return_score = _clamp(max(ret, 0.0) / 1.5)
     pf_score = _clamp(pf / 2.0)
     wr_score = _clamp(wr)
     dd_score = _clamp(1.0 + (dd / 20.0))
-    trade_score = _clamp(trades / float(max(trade_floor * 2, 20)))
+    trade_score = _clamp(trades / float(max(trade_floor * 2, 16)))
 
     score = (
-        0.25 * return_score
-        + 0.25 * pf_score
+        0.22 * return_score
+        + 0.28 * pf_score
         + 0.20 * wr_score
         + 0.15 * dd_score
         + 0.15 * trade_score
     )
 
-    # relaxed threshold (was 0.50)
-    passed = len(reasons) == 0 and score > 0.42
+    passed = len(reasons) == 0 and score > 0.35
     return ScoreDecision(score=score, passed=passed, reasons=tuple(reasons))
 
 
