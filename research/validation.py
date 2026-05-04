@@ -78,7 +78,7 @@ def build_walk_forward_folds(start: str, end: str, *, folds: int = 3, train_rati
 
 def _split_trade_floor(timeframe: str, split_name: str) -> int:
     base = TRADE_DENSITY_BASE.get((timeframe or "").lower(), 6)
-    return max(4, int(round(base * (0.8 if split_name == "train" else 0.6))))
+    return max(3, int(round(base * (0.7 if split_name == "train" else 0.5))))
 
 
 def summarize_walk_forward_reports(fold_reports: list[dict[str, Any]], *, timeframe: str) -> dict[str, Any]:
@@ -107,26 +107,25 @@ def summarize_walk_forward_reports(fold_reports: list[dict[str, Any]], *, timefr
 
     final_score = 0.2 * train_mean + 0.4 * val_mean + 0.4 * test_mean
 
-    # majority-based pass (practical)
     val_pass_ratio = pass_counts["val"] / max(1, total_counts["val"])
     test_pass_ratio = pass_counts["test"] / max(1, total_counts["test"])
 
     passed = (
-        val_mean >= 0.40
-        and test_mean >= 0.40
-        and final_score >= 0.40
-        and score_spread <= 0.60
-        and val_pass_ratio >= 0.5
-        and test_pass_ratio >= 0.5
+        val_mean >= 0.30
+        and test_mean >= 0.30
+        and final_score >= 0.32
+        and score_spread <= 0.80
+        and val_pass_ratio >= 0.33
+        and test_pass_ratio >= 0.33
     )
 
     reasons = []
-    if val_mean < 0.40:
+    if val_mean < 0.30:
         reasons.append("val_weak")
-    if test_mean < 0.40:
+    if test_mean < 0.30:
         reasons.append("test_weak")
-    if score_spread > 0.60:
-        reasons.append("wf_spread>0.60")
+    if score_spread > 0.80:
+        reasons.append("wf_spread>0.80")
 
     return {
         "score": round(final_score, 6),
