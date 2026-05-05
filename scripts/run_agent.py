@@ -4,16 +4,13 @@ import argparse
 import importlib
 import inspect
 import json
-import math
 import random
-import statistics
 import subprocess
-import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 STORE_PATH = ROOT / ".strategy_store.json"
@@ -21,6 +18,7 @@ STORE_PATH = ROOT / ".strategy_store.json"
 EVALUATOR_MODULE_CANDIDATES = (
     "scripts.backtest",
     "scripts.evaluator",
+    "scripts.engine",
     "backtest",
     "evaluator",
     "engine.backtest",
@@ -45,7 +43,6 @@ class GateConfig:
     max_drawdown_pct: float = 15.0
     min_trades: int = 20
     max_mc_drawdown_pct: float = 15.0
-    min_density: float = 0.75
 
 
 @dataclass
@@ -75,11 +72,7 @@ class StrategyRegistry:
         if self.path.exists():
             with self.path.open("r", encoding="utf-8") as f:
                 return json.load(f)
-        return {
-            "counters": {"evolution_id": 0, "experiment_id": 0},
-            "evolution_runs": [],
-            "experiments": [],
-        }
+        return {"counters": {"evolution_id": 0, "experiment_id": 0}, "evolution_runs": [], "experiments": []}
 
     def next_evolution_id(self) -> int:
         counters = self.data.setdefault("counters", {})
@@ -92,19 +85,18 @@ class StrategyRegistry:
 
     def best_parent(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
         runs = [
-            r
-            for r in self.data.get("evolution_runs", [])
+            r for r in self.data.get("evolution_runs", [])
             if r.get("symbol") == symbol and r.get("timeframe") == timeframe
         ]
         if not runs:
             return None
-        scored = sorted(runs, key=lambda r: (float(r.get("score", 0.0)), float(r.get("metrics", {}).get("backtest", {}).get("profit_factor", 0.0))), reverse=True)
-        return scored[0]
+        runs.sort(key=lambda r: (float(r.get("score", 0.0)), float(r.get("metrics", {}).get("backtest", {}).get("profit_factor", 0.0))), reverse=True)
+        return runs[0]
 
     def _save(self) -> None:
         tmp = self.path.with_suffix(".tmp")
         with tmp.open("w", encoding="utf-8") as f:
-            json.dump(self.data, f, indent=2, sort_keys=False)
+            json.dump(self.data, f, indent=2, ensure_ascii=False)
         tmp.replace(self.path)
 
 
@@ -117,20 +109,19 @@ def git_revision() -> str:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             cwd=ROOT,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
             check=True,
         )
-        return out.stdout.strip()
+        return out.stdout.strip() or "unknown"
     except Exception:
         return "unknown"
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        if value is None:
-            return default
-        return float(value)
+        return default if value is None else float(value)
     except Exception:
         return default
 
@@ -140,10 +131,10 @@ def clamp(value: float, lo: float, hi: float) -> float:
 
 
 def infer_regime(parameters: Dict[str, Any]) -> str:
-    entry_mode = str(parameters.get("entry_mode", "")).lower()
-    if "trend" in entry_mode:
+    mode = str(parameters.get("entry_mode", "mean_reversion")).lower()
+    if "trend" in mode:
         return "trend"
-    if "hybrid" in entry_mode:
+    if "hybrid" in mode:
         return "hybrid"
     return "mean_reversion"
 
@@ -156,24 +147,19 @@ def regime_weights(regime: str) -> Dict[str, float]:
     return {"trend": 0.20, "hybrid": 0.25, "mean_reversion": 0.55}
 
 
-def choose_mutation_family(parent: Dict[str, Any], iteration: int, candidate_idx: int, rng: random.Random) -> str:
-    parameters = parent.get("parameters", {}) if parent else {}
-    parent_regime = infer_regime(parameters)
-    weights = regime_weights(parent_regime)
-    if parent.get("reasons"):
-        reasons = " ".join(map(str, parent["reasons"]))
-        if "val_weak" in reasons or "test_weak" in reasons:
-            weights["trend"] += 0.10
-            weights["hybrid"] += 0.10
-        if "pf<" in reasons:
-            weights["mean_reversion"] += 0.05
+def choose_mutation_family(parent: Dict[str, Any], iteration: int, rng: random.Random) -> str:
+    params = parent.get("parameters", {}) if parent else {}
+    regime = infer_regime(params)
+    weights = regime_weights(regime)
+    notes = str(parent.get("notes", "") or "")
+    if "val_weak" in notes or "test_weak" in notes:
+        weights["trend"] += 0.10
+        weights["hybrid"] += 0.10
     if iteration > 5:
         weights["hybrid"] += 0.05
-    families = list(weights.keys())
-    probs = [max(0.01, weights[k]) for k in families]
-    total = sum(probs)
-    probs = [p / total for p in probs]
-    return rng.choices(families, weights=probs, k=1)[0]
+    choices = list(weights.keys())
+    probs = [max(0.01, weights[c]) for c in choices]
+    return rng.choices(choices, weights=probs, k=1)[0]
 
 
 def mutate_parameters(base: Dict[str, Any], family: str, rng: random.Random) -> Dict[str, Any]:
@@ -183,51 +169,57 @@ def mutate_parameters(base: Dict[str, Any], family: str, rng: random.Random) -> 
         return clamp(v + rng.gauss(0.0, scale), lo, hi)
 
     if family == "trend":
-        p["entry_mode"] = "trend"
-        p["use_trend_filter"] = True
-        p["use_structure_filter"] = True
-        p["use_htf_filter"] = True
-        p["use_reclaim_filter"] = rng.random() < 0.35
-        p["use_volume_filter"] = rng.random() < 0.50
-        p["use_bb_filter"] = True
-        p["min_adx"] = j(safe_float(p.get("min_adx", 12.0)), 3.0, 10.0, 35.0)
-        p["min_bb_rank"] = j(safe_float(p.get("min_bb_rank", 0.20)), 0.08, 0.05, 0.65)
-        p["min_atr_rank"] = j(safe_float(p.get("min_atr_rank", 0.18)), 0.07, 0.05, 0.60)
-        p["rsi_max"] = j(safe_float(p.get("rsi_max", 40.0)), 5.0, 25.0, 60.0)
-        p["stop_atr_mult"] = j(safe_float(p.get("stop_atr_mult", 2.8)), 0.5, 1.4, 5.0)
-        p["tp1_rr"] = j(safe_float(p.get("tp1_rr", 2.2)), 0.4, 1.2, 5.0)
+        p.update({
+            "entry_mode": "trend",
+            "use_trend_filter": True,
+            "use_structure_filter": True,
+            "use_htf_filter": True,
+            "use_reclaim_filter": rng.random() < 0.35,
+            "use_volume_filter": rng.random() < 0.50,
+            "use_bb_filter": True,
+            "min_adx": j(safe_float(p.get("min_adx", 12.0)), 3.0, 10.0, 35.0),
+            "min_bb_rank": j(safe_float(p.get("min_bb_rank", 0.20)), 0.08, 0.05, 0.65),
+            "min_atr_rank": j(safe_float(p.get("min_atr_rank", 0.18)), 0.07, 0.05, 0.60),
+            "rsi_max": j(safe_float(p.get("rsi_max", 40.0)), 5.0, 25.0, 60.0),
+            "stop_atr_mult": j(safe_float(p.get("stop_atr_mult", 2.8)), 0.5, 1.4, 5.0),
+            "tp1_rr": j(safe_float(p.get("tp1_rr", 2.2)), 0.4, 1.2, 5.0),
+        })
         p["max_bars_override"] = int(j(safe_float(p.get("max_bars_override", 24)), 4.0, 8.0, 80.0))
         p["cooldown_bars"] = int(j(safe_float(p.get("cooldown_bars", 10)), 3.0, 1.0, 60.0))
     elif family == "hybrid":
-        p["entry_mode"] = "hybrid"
-        p["use_trend_filter"] = rng.random() < 0.75
-        p["use_structure_filter"] = rng.random() < 0.80
-        p["use_htf_filter"] = rng.random() < 0.85
-        p["use_reclaim_filter"] = rng.random() < 0.55
-        p["use_volume_filter"] = rng.random() < 0.55
-        p["use_bb_filter"] = True
-        p["min_adx"] = j(safe_float(p.get("min_adx", 8.0)), 2.0, 5.0, 28.0)
-        p["min_bb_rank"] = j(safe_float(p.get("min_bb_rank", 0.12)), 0.05, 0.03, 0.55)
-        p["min_atr_rank"] = j(safe_float(p.get("min_atr_rank", 0.12)), 0.05, 0.03, 0.55)
-        p["rsi_max"] = j(safe_float(p.get("rsi_max", 34.0)), 4.0, 18.0, 55.0)
-        p["stop_atr_mult"] = j(safe_float(p.get("stop_atr_mult", 2.0)), 0.35, 1.1, 4.5)
-        p["tp1_rr"] = j(safe_float(p.get("tp1_rr", 2.0)), 0.3, 1.1, 4.5)
+        p.update({
+            "entry_mode": "hybrid",
+            "use_trend_filter": rng.random() < 0.75,
+            "use_structure_filter": rng.random() < 0.80,
+            "use_htf_filter": rng.random() < 0.85,
+            "use_reclaim_filter": rng.random() < 0.55,
+            "use_volume_filter": rng.random() < 0.55,
+            "use_bb_filter": True,
+            "min_adx": j(safe_float(p.get("min_adx", 8.0)), 2.0, 5.0, 28.0),
+            "min_bb_rank": j(safe_float(p.get("min_bb_rank", 0.12)), 0.05, 0.03, 0.55),
+            "min_atr_rank": j(safe_float(p.get("min_atr_rank", 0.12)), 0.05, 0.03, 0.55),
+            "rsi_max": j(safe_float(p.get("rsi_max", 34.0)), 4.0, 18.0, 55.0),
+            "stop_atr_mult": j(safe_float(p.get("stop_atr_mult", 2.0)), 0.35, 1.1, 4.5),
+            "tp1_rr": j(safe_float(p.get("tp1_rr", 2.0)), 0.3, 1.1, 4.5),
+        })
         p["max_bars_override"] = int(j(safe_float(p.get("max_bars_override", 20)), 3.0, 6.0, 60.0))
         p["cooldown_bars"] = int(j(safe_float(p.get("cooldown_bars", 12)), 3.0, 1.0, 60.0))
     else:
-        p["entry_mode"] = "mean_reversion"
-        p["use_trend_filter"] = rng.random() < 0.20
-        p["use_structure_filter"] = rng.random() < 0.35
-        p["use_htf_filter"] = rng.random() < 0.30
-        p["use_reclaim_filter"] = rng.random() < 0.70
-        p["use_volume_filter"] = rng.random() < 0.45
-        p["use_bb_filter"] = True
-        p["min_adx"] = j(safe_float(p.get("min_adx", 5.0)), 1.5, 3.0, 18.0)
-        p["min_bb_rank"] = j(safe_float(p.get("min_bb_rank", 0.08)), 0.04, 0.02, 0.35)
-        p["min_atr_rank"] = j(safe_float(p.get("min_atr_rank", 0.08)), 0.04, 0.02, 0.35)
-        p["rsi_max"] = j(safe_float(p.get("rsi_max", 30.0)), 3.5, 15.0, 42.0)
-        p["stop_atr_mult"] = j(safe_float(p.get("stop_atr_mult", 1.6)), 0.20, 0.8, 3.0)
-        p["tp1_rr"] = j(safe_float(p.get("tp1_rr", 1.8)), 0.25, 1.0, 3.5)
+        p.update({
+            "entry_mode": "mean_reversion",
+            "use_trend_filter": rng.random() < 0.20,
+            "use_structure_filter": rng.random() < 0.35,
+            "use_htf_filter": rng.random() < 0.30,
+            "use_reclaim_filter": rng.random() < 0.70,
+            "use_volume_filter": rng.random() < 0.45,
+            "use_bb_filter": True,
+            "min_adx": j(safe_float(p.get("min_adx", 5.0)), 1.5, 3.0, 18.0),
+            "min_bb_rank": j(safe_float(p.get("min_bb_rank", 0.08)), 0.04, 0.02, 0.35),
+            "min_atr_rank": j(safe_float(p.get("min_atr_rank", 0.08)), 0.04, 0.02, 0.35),
+            "rsi_max": j(safe_float(p.get("rsi_max", 30.0)), 3.5, 15.0, 42.0),
+            "stop_atr_mult": j(safe_float(p.get("stop_atr_mult", 1.6)), 0.20, 0.8, 3.0),
+            "tp1_rr": j(safe_float(p.get("tp1_rr", 1.8)), 0.25, 1.0, 3.5),
+        })
         p["max_bars_override"] = int(j(safe_float(p.get("max_bars_override", 18)), 2.0, 4.0, 40.0))
         p["cooldown_bars"] = int(j(safe_float(p.get("cooldown_bars", 16)), 3.0, 2.0, 80.0))
 
@@ -235,12 +227,13 @@ def mutate_parameters(base: Dict[str, Any], family: str, rng: random.Random) -> 
     p["size_multiplier"] = clamp(j(safe_float(p.get("size_multiplier", 0.85)), 0.08, 0.35, 1.35), 0.35, 1.35)
     p["tp1_close_fraction"] = clamp(j(safe_float(p.get("tp1_close_fraction", 0.2)), 0.08, 0.05, 0.70), 0.05, 0.70)
     p["tp2_close_fraction"] = clamp(j(safe_float(p.get("tp2_close_fraction", 0.3)), 0.08, 0.05, 0.85), 0.05, 0.85)
-
+    p["mutation_family"] = family
+    p["regime_profile"] = infer_regime(p)
     return p
 
 
-def build_candidate_id(symbol: str, timeframe: str, evolution_id: int, rng: random.Random) -> str:
-    return f"evo_{symbol.lower().replace('/', '_')}_{timeframe}_{evolution_id}_{rng.randint(10000, 999999)}"
+def build_candidate_id(symbol: str, timeframe: str, evo_id: int, rng: random.Random) -> str:
+    return f"evo_{symbol.lower().replace('/', '_')}_{timeframe}_{evo_id}_{rng.randint(10000, 999999)}"
 
 
 def metric_score_component(value: float, lo: float, hi: float) -> float:
@@ -249,54 +242,41 @@ def metric_score_component(value: float, lo: float, hi: float) -> float:
     return clamp((value - lo) / (hi - lo), 0.0, 1.0)
 
 
-def extract_split_stat(split: Dict[str, Any]) -> Dict[str, float]:
-    return {
-        "pf": safe_float(split.get("profit_factor"), 0.0),
-        "wr": safe_float(split.get("win_rate"), 0.0),
-        "return_pct": safe_float(split.get("return_pct"), 0.0),
-        "dd": abs(safe_float(split.get("max_drawdown_pct"), 0.0)),
-        "trades": safe_float(split.get("trades"), 0.0),
-    }
-
-
 def compute_ranking_score(metrics: Dict[str, Any]) -> float:
     backtest = metrics.get("backtest", {}) or {}
-    walk_forward = metrics.get("walk_forward", {}) or {}
-    monte_carlo = metrics.get("monte_carlo", {}) or {}
+    wf = metrics.get("walk_forward", {}) or {}
+    mc = metrics.get("monte_carlo", {}) or {}
 
     pf = safe_float(backtest.get("profit_factor"), 0.0)
     wr = safe_float(backtest.get("win_rate"), 0.0)
     ret = safe_float(backtest.get("return_pct"), 0.0)
     dd = abs(safe_float(backtest.get("max_drawdown_pct"), 0.0))
     trades = safe_float(backtest.get("trades"), 0.0)
-
-    wf_score = safe_float(walk_forward.get("score"), safe_float(walk_forward.get("composite"), 0.0))
-    wf_spread = safe_float(walk_forward.get("score_spread"), 0.0)
-    density = safe_float(walk_forward.get("density_mean"), 0.0)
-    mc_dd = safe_float(monte_carlo.get("worst_drawdown_pct"), 0.0)
-
-    pf_score = metric_score_component(pf, 0.85, 2.0)
-    wr_score = metric_score_component(wr, 0.35, 0.70)
-    ret_score = metric_score_component(ret, -25.0, 25.0)
-    dd_score = 1.0 - metric_score_component(dd, 0.0, 30.0)
-    trades_score = metric_score_component(trades, 10.0, 80.0)
-    density_score = clamp(density, 0.0, 1.0)
-    wf_score = clamp(wf_score, 0.0, 1.0)
-    spread_penalty = metric_score_component(wf_spread, 0.0, 0.40)
-    mc_penalty = metric_score_component(abs(mc_dd), 0.0, 20.0)
+    wf_score = safe_float(wf.get("score"), safe_float(wf.get("composite"), 0.0))
+    wf_spread = safe_float(wf.get("score_spread"), 0.0)
+    density = safe_float(wf.get("density_mean"), 0.0)
+    mc_dd = abs(safe_float(mc.get("worst_drawdown_pct"), 0.0))
 
     score = (
-        0.22 * pf_score
-        + 0.18 * wr_score
-        + 0.14 * ret_score
-        + 0.16 * dd_score
-        + 0.16 * wf_score
-        + 0.08 * density_score
-        + 0.06 * trades_score
-        - 0.04 * spread_penalty
-        - 0.06 * mc_penalty
+        0.22 * metric_score_component(pf, 0.85, 2.0)
+        + 0.18 * metric_score_component(wr, 0.35, 0.70)
+        + 0.14 * metric_score_component(ret, -25.0, 25.0)
+        + 0.16 * (1.0 - metric_score_component(dd, 0.0, 30.0))
+        + 0.16 * clamp(wf_score, 0.0, 1.0)
+        + 0.08 * clamp(density, 0.0, 1.0)
+        + 0.06 * metric_score_component(trades, 10.0, 80.0)
+        - 0.04 * metric_score_component(wf_spread, 0.0, 0.40)
+        - 0.06 * metric_score_component(mc_dd, 0.0, 20.0)
     )
     return round(clamp(score, 0.0, 1.0), 6)
+
+
+def extract_split_stat(split: Dict[str, Any]) -> Dict[str, float]:
+    return {
+        "pf": safe_float(split.get("profit_factor"), 0.0),
+        "wr": safe_float(split.get("win_rate"), 0.0),
+        "trades": safe_float(split.get("trades"), 0.0),
+    }
 
 
 def evaluate_gates(metrics: Dict[str, Any], walk_forward: Dict[str, Any], cfg: GateConfig) -> Tuple[bool, Tuple[str, ...], Dict[str, bool]]:
@@ -305,7 +285,6 @@ def evaluate_gates(metrics: Dict[str, Any], walk_forward: Dict[str, Any], cfg: G
 
     backtest = metrics.get("backtest", {}) or {}
     monte_carlo = metrics.get("monte_carlo", {}) or {}
-
     pf = safe_float(backtest.get("profit_factor"), 0.0)
     wr = safe_float(backtest.get("win_rate"), 0.0)
     ret = safe_float(backtest.get("return_pct"), 0.0)
@@ -316,9 +295,9 @@ def evaluate_gates(metrics: Dict[str, Any], walk_forward: Dict[str, Any], cfg: G
     gate_state["pf_gate"] = pf >= cfg.min_profit_factor
     gate_state["return_gate"] = ret >= cfg.min_return_pct
     gate_state["dd_gate"] = dd <= cfg.max_drawdown_pct
+    gate_state["walk_forward_gate"] = bool(walk_forward.get("passed", False))
     gate_state["monte_carlo_gate"] = mc_dd <= cfg.max_mc_drawdown_pct
     gate_state["density_gate"] = trades >= cfg.min_trades
-    gate_state["walk_forward_gate"] = bool(walk_forward.get("passed", False))
 
     if not gate_state["pf_gate"]:
         reasons.append(f"pf<{cfg.min_profit_factor}")
@@ -333,27 +312,21 @@ def evaluate_gates(metrics: Dict[str, Any], walk_forward: Dict[str, Any], cfg: G
     if not gate_state["density_gate"]:
         reasons.append("density_gate")
 
-    split_results = walk_forward.get("split_results", {}) or {}
-    split_reasons: List[str] = []
     split_ok = True
+    split_reasons: List[str] = []
     for split_name in ("train", "val", "test"):
-        for split in split_results.get(split_name, []):
+        for split in (walk_forward.get("split_results", {}) or {}).get(split_name, []):
             stat = extract_split_stat(split)
-            local_ok = True
             local_reasons: List[str] = []
             if stat["trades"] < cfg.min_trades:
-                local_ok = False
                 local_reasons.append("trades<20")
             if stat["pf"] < cfg.min_profit_factor:
-                local_ok = False
                 local_reasons.append(f"pf<{cfg.min_profit_factor}")
             if stat["wr"] < cfg.min_win_rate:
-                local_ok = False
                 local_reasons.append(f"wr<{cfg.min_win_rate}")
-            if not local_ok:
+            if local_reasons:
                 split_ok = False
                 split_reasons.extend([f"{split_name}:{reason}" for reason in local_reasons])
-
     gate_state["split_gate"] = split_ok
     if not split_ok:
         reasons.extend(split_reasons)
@@ -370,27 +343,27 @@ def normalize_evaluation_output(result: Any) -> Dict[str, Any]:
             return result.to_dict()  # type: ignore[no-any-return]
         except Exception:
             pass
-    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
-        return result[1]
     raise TypeError(f"Unsupported evaluator return type: {type(result)!r}")
 
 
 def resolve_evaluator() -> Callable[..., Any]:
-    attempted: List[str] = []
     for module_name in EVALUATOR_MODULE_CANDIDATES:
         try:
             module = importlib.import_module(module_name)
         except Exception:
-            attempted.append(module_name)
             continue
-        for func_name in EVALUATOR_FUNCTION_CANDIDATES:
-            fn = getattr(module, func_name, None)
+        for fn_name in EVALUATOR_FUNCTION_CANDIDATES:
+            fn = getattr(module, fn_name, None)
             if callable(fn):
                 return fn
-    raise RuntimeError(
-        "Could not locate an evaluator/backtest function. Tried: " + ", ".join(attempted) + ". "
-        "Update EVALUATOR_MODULE_CANDIDATES / EVALUATOR_FUNCTION_CANDIDATES to match the repo."
-    )
+    raise RuntimeError("Could not locate an evaluator/backtest function. Update EVALUATOR_MODULE_CANDIDATES / EVALUATOR_FUNCTION_CANDIDATES.")
+
+
+def _attempt_call(fn: Callable[..., Any], args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Any:
+    try:
+        return fn(*args, **kwargs)
+    except TypeError:
+        return None
 
 
 def call_evaluator(
@@ -403,37 +376,39 @@ def call_evaluator(
     parameters: Dict[str, Any],
 ) -> Dict[str, Any]:
     sig = inspect.signature(evaluator)
-    base_kwargs = {
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "ltf_timeframe": timeframe,
-        "start": start,
-        "end": end,
-        "parameters": parameters,
-        "params": parameters,
-        "strategy_params": parameters,
-        "config": parameters,
-    }
-    accepted = {k: v for k, v in base_kwargs.items() if k in sig.parameters}
-    try:
-        result = evaluator(**accepted)
-    except TypeError:
-        # Fall back to several common calling conventions.
-        for payload in (
-            {"symbol": symbol, "timeframe": timeframe, "start": start, "end": end, "parameters": parameters},
-            {"symbol": symbol, "timeframe": timeframe, "start": start, "end": end, "params": parameters},
-            {"symbol": symbol, "timeframe": timeframe, "start": start, "end": end},
-            {"parameters": parameters},
-            {"params": parameters},
-        ):
-            try:
-                result = evaluator(**{k: v for k, v in payload.items() if k in sig.parameters})
-                break
-            except TypeError:
-                continue
-        else:
-            raise
-    return normalize_evaluation_output(result)
+    param_names = list(sig.parameters.keys())
+
+    kwargs_variants = [
+        {"sym": symbol, "tf": timeframe, "start": start, "end": end, "parameters": parameters},
+        {"symbol": symbol, "timeframe": timeframe, "start": start, "end": end, "parameters": parameters},
+        {"sym": symbol, "tf": timeframe, "start": start, "end": end, "params": parameters},
+        {"symbol": symbol, "timeframe": timeframe, "start": start, "end": end, "params": parameters},
+        {"sym": symbol, "tf": timeframe, "start": start, "end": end},
+        {"symbol": symbol, "timeframe": timeframe, "start": start, "end": end},
+        {"parameters": parameters},
+        {"params": parameters},
+    ]
+
+    for raw_kwargs in kwargs_variants:
+        kwargs = {k: v for k, v in raw_kwargs.items() if k in param_names}
+        if not kwargs and not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            continue
+        result = _attempt_call(evaluator, tuple(), kwargs)
+        if result is not None:
+            return normalize_evaluation_output(result)
+
+    positional_variants = [
+        (symbol, timeframe, start, end, parameters),
+        (symbol, timeframe, start, end),
+        (symbol, timeframe),
+        (symbol,),
+    ]
+    for args in positional_variants:
+        result = _attempt_call(evaluator, args, {})
+        if result is not None:
+            return normalize_evaluation_output(result)
+
+    raise TypeError("Unable to call evaluator with supported signatures.")
 
 
 def strategy_family_name(parameters: Dict[str, Any]) -> str:
@@ -474,7 +449,7 @@ def select_parent(store: StrategyRegistry, symbol: str, timeframe: str) -> Dict[
             "tp2_close_fraction": 0.3,
         },
         "score": 0.0,
-        "reasons": (),
+        "notes": "",
     }
 
 
@@ -500,12 +475,10 @@ def evaluate_one(
 ) -> CandidateResult:
     rng = random.Random(rng_seed)
     parent = select_parent(store, symbol, timeframe)
-    family = choose_mutation_family(parent, iteration, candidate_idx, rng)
+    family = choose_mutation_family(parent, iteration, rng)
     parameters = mutate_parameters(parent.get("parameters", {}), family, rng)
-    parameters["mutation_family"] = family
-    parameters["regime_profile"] = strategy_family_name(parameters)
-
     child_id = build_candidate_id(symbol, timeframe, store.next_evolution_id(), rng)
+
     evaluation = call_evaluator(
         evaluator,
         symbol=symbol,
@@ -559,7 +532,7 @@ def print_candidate(result: CandidateResult) -> None:
     backtest = result.metrics.get("backtest", {}) or {}
     walk_forward = result.metrics.get("walk_forward", {}) or {}
     monte_carlo = result.metrics.get("monte_carlo", {}) or {}
-    row = {
+    print({
         "iteration": int(result.cycle_id.split("_")[-1]),
         "best_strategy": result.child_strategy_id,
         "score": result.score,
@@ -574,8 +547,7 @@ def print_candidate(result: CandidateResult) -> None:
         "gate_state": result.metrics.get("gate_state", {}),
         "wf_score": round(safe_float(walk_forward.get("score"), safe_float(walk_forward.get("composite"), 0.0)), 6),
         "mc_dd": round(abs(safe_float(monte_carlo.get("worst_drawdown_pct"), 0.0)), 4),
-    }
-    print(row)
+    })
 
 
 def parse_args() -> argparse.Namespace:
@@ -606,7 +578,6 @@ def main() -> int:
         max_drawdown_pct=args.max_dd_pct,
         min_trades=args.min_trades,
         max_mc_drawdown_pct=args.max_mc_dd_pct,
-        min_density=0.75,
     )
     evaluator = resolve_evaluator()
     store = StrategyRegistry(STORE_PATH)
@@ -631,27 +602,24 @@ def main() -> int:
         with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
             for candidate_idx in range(max(1, args.candidates)):
                 seed = rng.randint(0, 10**9)
-                futures.append(
-                    executor.submit(
-                        evaluate_one,
-                        evaluator,
-                        store,
-                        args.symbol,
-                        args.timeframe,
-                        args.start,
-                        args.end,
-                        cfg,
-                        iteration,
-                        candidate_idx,
-                        seed,
-                    )
-                )
+                futures.append(executor.submit(
+                    evaluate_one,
+                    evaluator,
+                    store,
+                    args.symbol,
+                    args.timeframe,
+                    args.start,
+                    args.end,
+                    cfg,
+                    iteration,
+                    candidate_idx,
+                    seed,
+                ))
             for future in as_completed(futures):
                 results.append(future.result())
 
         results.sort(key=lambda r: (r.score, float(r.metrics.get("backtest", {}).get("profit_factor", 0.0))), reverse=True)
-        best = results[0]
-        print_candidate(best)
+        print_candidate(results[0])
 
     return 0
 
