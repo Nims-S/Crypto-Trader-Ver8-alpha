@@ -1,4 +1,4 @@
-# shim
+"""Backward-compatible database bootstrap shim."""
 
-def init_db():
-    return None
+from registry.bootstrap import init_db
+

@@ -114,6 +114,10 @@ def utc_now() -> str:
 
 
 def git_revision() -> str:
+    git_dir = ROOT / ".git"
+    if not git_dir.exists():
+        return "unknown"
+
     try:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"],
