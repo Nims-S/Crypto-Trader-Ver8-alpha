@@ -49,6 +49,9 @@ class CandidateResult:
     iteration: int
 
 
+ELITE_STATUSES = {"validated", "deployable", "live"}
+
+
 def _normalize_parent(row: Any, symbol: str, timeframe: str) -> dict[str, Any]:
     if row is None:
         seed = seed_strategy(symbol, timeframe)
@@ -84,29 +87,24 @@ def _composite_parent_score(row: dict[str, Any]) -> float:
     )
 
 
+def _elite_ranked(cfg: AgentConfig, limit: int = 20) -> list[dict[str, Any]]:
+    ranked = rank_strategies(symbol=cfg.symbol, timeframe=cfg.timeframe, active_only=False, limit=limit)
+    elite = [r for r in ranked if str(r.get("status") or "").lower() in ELITE_STATUSES]
+    return elite or ranked
+
+
 def _choose_parent(cfg: AgentConfig, prev_parent_id: str | None = None) -> dict[str, Any]:
-    ranked = rank_strategies(symbol=cfg.symbol, timeframe=cfg.timeframe, active_only=False, limit=10)
-    if not ranked:
+    pool = _elite_ranked(cfg, limit=20)
+    if not pool:
         return _normalize_parent(None, cfg.symbol, cfg.timeframe)
 
-    pool = ranked[: min(5, len(ranked))]
     if prev_parent_id:
         alt_pool = [r for r in pool if str(r.get("strategy_id")) != str(prev_parent_id)]
         if alt_pool:
             pool = alt_pool
 
-    weights = []
-    for row in pool:
-        score = max(0.0, _composite_parent_score(row))
-        weights.append(score if score > 0 else 0.01)
-
-    total = sum(weights)
-    if total <= 0:
-        choice = random.choice(pool)
-        return _normalize_parent(choice, cfg.symbol, cfg.timeframe)
-
-    choice = random.choices(pool, weights=weights, k=1)[0]
-    return _normalize_parent(choice, cfg.symbol, cfg.timeframe)
+    pool.sort(key=lambda r: (_composite_parent_score(r), float(r.get("robustness_score", 0.0) or 0.0)), reverse=True)
+    return _normalize_parent(pool[0], cfg.symbol, cfg.timeframe)
 
 
 def _split_window(start: str, end: str) -> tuple[tuple[str, str], tuple[str, str], tuple[str, str]]:
@@ -130,7 +128,7 @@ def _extract_trade_pnls(trades: list[dict[str, Any]]) -> list[float]:
     return pnls
 
 
-def _run_monte_carlo(trades: list[dict[str, Any]], simulations: int = 300, seed: int | None = None) -> dict[str, Any]:
+def _run_monte_carlo(trades: list[dict[str, Any]], simulations: int = 200, seed: int | None = None) -> dict[str, Any]:
     pnls = _extract_trade_pnls(trades)
     if not pnls:
         return {"median_return_pct": -100.0, "worst_drawdown_pct": 100.0}
@@ -161,9 +159,24 @@ def _run_monte_carlo(trades: list[dict[str, Any]], simulations: int = 300, seed:
     }
 
 
-def _evaluate_candidate(candidate: StrategyCandidate, cfg: AgentConfig, iteration: int, parent_id: str) -> CandidateResult:
-    params = dict(candidate.parameters or {})
+def _quick_proxy_score(backtest: dict[str, Any]) -> float:
+    ret = float(backtest.get("return_pct", 0.0) or 0.0)
+    dd = abs(float(backtest.get("max_drawdown_pct", 0.0) or 0.0))
+    pf = float(backtest.get("profit_factor", 0.0) or 0.0)
+    wr = float(backtest.get("win_rate", 0.0) or 0.0)
+    trades = int(backtest.get("trades", 0) or 0)
 
+    return (
+        0.35 * max(-1.0, min(1.0, ret / 2.0))
+        + 0.25 * max(0.0, min(1.0, pf / 2.0))
+        + 0.15 * max(0.0, min(1.0, wr))
+        + 0.15 * max(0.0, min(1.0, 1.0 - (dd / 20.0)))
+        + 0.10 * max(0.0, min(1.0, trades / 20.0))
+    )
+
+
+def _quick_evaluate_candidate(candidate: StrategyCandidate, cfg: AgentConfig, iteration: int, parent_id: str) -> CandidateResult:
+    params = dict(candidate.parameters or {})
     bt = run_backtest(
         cfg.symbol,
         cfg.timeframe,
@@ -171,6 +184,14 @@ def _evaluate_candidate(candidate: StrategyCandidate, cfg: AgentConfig, iteratio
         cfg.end,
         strategy_override={"parameters": params},
     )
+    quick_score = _quick_proxy_score(bt)
+    score = AgentScore(score=round(float(quick_score), 6), passed=False, reasons=tuple())
+    return CandidateResult(candidate=candidate, backtest=bt, walk_forward={}, monte_carlo={}, score=score, parent_id=parent_id, iteration=iteration)
+
+
+def _full_evaluate_candidate(result: CandidateResult, cfg: AgentConfig) -> CandidateResult:
+    params = dict(result.candidate.parameters or {})
+    bt = result.backtest
 
     wf_folds = build_walk_forward_folds(cfg.start, cfg.end, folds=max(1, int(cfg.folds)))
     fold_reports: list[dict[str, Any]] = []
@@ -186,13 +207,15 @@ def _evaluate_candidate(candidate: StrategyCandidate, cfg: AgentConfig, iteratio
         )
 
     wf = summarize_walk_forward_reports(fold_reports, timeframe=cfg.timeframe)
-    mc = _run_monte_carlo(bt.get("trades_detail", []), seed=iteration)
+    mc = {"median_return_pct": -100.0, "worst_drawdown_pct": 100.0}
+    if wf.get("passed") or float(wf.get("score", 0.0) or 0.0) >= 0.4:
+        mc = _run_monte_carlo(bt.get("trades_detail", []), seed=result.iteration)
+
     score = score_candidate(bt, wf, mc, goal_return_pct=cfg.goal_return, max_drawdown_pct=cfg.max_dd)
+    return CandidateResult(candidate=result.candidate, backtest=bt, walk_forward=wf, monte_carlo=mc, score=score, parent_id=result.parent_id, iteration=result.iteration)
 
-    return CandidateResult(candidate=candidate, backtest=bt, walk_forward=wf, monte_carlo=mc, score=score, parent_id=parent_id, iteration=iteration)
 
-
-def _persist_candidate(result: CandidateResult, cfg: AgentConfig) -> None:
+def _persist_candidate(result: CandidateResult, cfg: AgentConfig) -> dict[str, Any]:
     candidate = result.candidate
     bt = result.backtest
     wf = result.walk_forward
@@ -234,11 +257,13 @@ def _persist_candidate(result: CandidateResult, cfg: AgentConfig) -> None:
         robustness_score=float(wf.get("score", 0.0) or 0.0),
         parent_strategy_id=result.parent_id,
     )
+    return status_info
 
 
 def run_agent(cfg: AgentConfig) -> dict[str, Any]:
     parent = _choose_parent(cfg)
     best_overall: CandidateResult | None = None
+    elite_archive: list[dict[str, Any]] = []
 
     llm_client = get_default_llm_client()
     prev_parent_id: str | None = None
@@ -250,7 +275,10 @@ def run_agent(cfg: AgentConfig) -> dict[str, Any]:
             break
 
         feedback = build_feedback_summary(symbol=cfg.symbol, timeframe=cfg.timeframe)
-        diversity_pool = rank_strategies(symbol=cfg.symbol, timeframe=cfg.timeframe, active_only=False, limit=10)
+        diversity_pool = _elite_ranked(cfg, limit=10)
+        if elite_archive:
+            # keep the archive separate from the live parent but available for diversity pressure
+            diversity_pool = (elite_archive + diversity_pool)[:15]
 
         children = mutate_parent(
             parent,
@@ -262,23 +290,40 @@ def run_agent(cfg: AgentConfig) -> dict[str, Any]:
             llm_client=llm_client,
         )
 
-        results: list[CandidateResult] = []
+        if not children:
+            raise RuntimeError("agent produced no candidates")
+
+        quick_results: list[CandidateResult] = []
         parent_id = str(parent.get("strategy_id") if isinstance(parent, dict) else getattr(parent, "strategy_id", "seed"))
 
         if cfg.workers > 1 and len(children) > 1:
             with ThreadPoolExecutor(max_workers=int(cfg.workers)) as pool:
-                futures = [pool.submit(_evaluate_candidate, c, cfg, iteration, parent_id) for c in children]
+                futures = [pool.submit(_quick_evaluate_candidate, c, cfg, iteration, parent_id) for c in children]
+                for fut in as_completed(futures):
+                    quick_results.append(fut.result())
+        else:
+            for c in children:
+                quick_results.append(_quick_evaluate_candidate(c, cfg, iteration, parent_id))
+
+        quick_results.sort(key=lambda r: r.score.score, reverse=True)
+        full_eval_count = min(len(quick_results), max(2, min(3, len(quick_results))))
+        selected = quick_results[:full_eval_count]
+
+        results: list[CandidateResult] = []
+        if cfg.workers > 1 and len(selected) > 1:
+            with ThreadPoolExecutor(max_workers=int(cfg.workers)) as pool:
+                futures = [pool.submit(_full_evaluate_candidate, r, cfg) for r in selected]
                 for fut in as_completed(futures):
                     results.append(fut.result())
         else:
-            for c in children:
-                results.append(_evaluate_candidate(c, cfg, iteration, parent_id))
+            for r in selected:
+                results.append(_full_evaluate_candidate(r, cfg))
 
         if not results:
-            raise RuntimeError("agent produced no candidates")
+            raise RuntimeError("agent produced no evaluable candidates")
 
         best = max(results, key=lambda r: r.score.score)
-        _persist_candidate(best, cfg)
+        status_info = _persist_candidate(best, cfg)
 
         if best_overall is None or best.score.score > best_overall.score.score:
             best_overall = best
@@ -289,7 +334,8 @@ def run_agent(cfg: AgentConfig) -> dict[str, Any]:
                 "best_strategy": best.candidate.strategy_id,
                 "score": best.score.score,
                 "passed": best.score.passed,
-                "reasons": best.score.reasons,
+                "status": status_info.get("status"),
+                "reasons": tuple(status_info.get("reasons") or []),
                 "return_pct": best.backtest.get("return_pct"),
                 "max_dd": best.backtest.get("max_drawdown_pct"),
                 "pf": best.backtest.get("profit_factor"),
@@ -297,6 +343,47 @@ def run_agent(cfg: AgentConfig) -> dict[str, Any]:
                 "wf_passed": best.walk_forward.get("passed"),
             }
         )
+
+        if status_info.get("status") in ELITE_STATUSES:
+            elite_record = {
+                "strategy_id": best.candidate.strategy_id,
+                "base_strategy": best.candidate.base_strategy,
+                "version": best.candidate.version,
+                "parameters": best.candidate.parameters,
+                "symbol": cfg.symbol,
+                "timeframe": cfg.timeframe,
+                "tags": best.candidate.tags,
+                "source": best.candidate.source,
+                "metrics": {"backtest": best.backtest, "walk_forward": best.walk_forward, "monte_carlo": best.monte_carlo, "agent_score": best.score.as_dict()},
+                "robustness_score": float(best.walk_forward.get("score", 0.0) or 0.0),
+                "status": status_info.get("status"),
+                "active": bool(status_info.get("active")),
+            }
+            elite_archive = [e for e in elite_archive if e.get("strategy_id") != elite_record["strategy_id"]]
+            elite_archive.append(elite_record)
+            elite_archive.sort(key=lambda r: (_composite_parent_score(r), float(r.get("robustness_score", 0.0) or 0.0)), reverse=True)
+            elite_archive = elite_archive[:10]
+
+        # Only advance the live parent when the candidate itself is validated or better.
+        if status_info.get("status") in ELITE_STATUSES:
+            parent = _normalize_parent(
+                {
+                    "strategy_id": best.candidate.strategy_id,
+                    "base_strategy": best.candidate.base_strategy,
+                    "version": best.candidate.version,
+                    "parameters": best.candidate.parameters,
+                    "symbol": cfg.symbol,
+                    "timeframe": cfg.timeframe,
+                    "tags": best.candidate.tags,
+                    "source": best.candidate.source,
+                },
+                cfg.symbol,
+                cfg.timeframe,
+            )
+            prev_parent_id = parent_id
+        else:
+            # keep the current live parent unchanged
+            pass
 
         if best.score.passed:
             return {
@@ -307,24 +394,6 @@ def run_agent(cfg: AgentConfig) -> dict[str, Any]:
                 "walk_forward": best.walk_forward,
                 "monte_carlo": best.monte_carlo,
             }
-
-        # Explore from the next strongest parent instead of the same lineage every loop.
-        next_parent = _choose_parent(cfg, prev_parent_id=parent_id)
-        prev_parent_id = parent_id
-        parent = _normalize_parent(
-            {
-                "strategy_id": next_parent.get("strategy_id") if isinstance(next_parent, dict) else parent_id,
-                "base_strategy": next_parent.get("base_strategy") if isinstance(next_parent, dict) else best.candidate.base_strategy,
-                "version": next_parent.get("version") if isinstance(next_parent, dict) else best.candidate.version,
-                "parameters": next_parent.get("parameters") if isinstance(next_parent, dict) else best.candidate.parameters,
-                "symbol": cfg.symbol,
-                "timeframe": cfg.timeframe,
-                "tags": next_parent.get("tags") if isinstance(next_parent, dict) else best.candidate.tags,
-                "source": next_parent.get("source") if isinstance(next_parent, dict) else best.candidate.source,
-            },
-            cfg.symbol,
-            cfg.timeframe,
-        )
 
         if cfg.continuous:
             time.sleep(max(0.0, float(cfg.sleep_seconds or 0.0)))
