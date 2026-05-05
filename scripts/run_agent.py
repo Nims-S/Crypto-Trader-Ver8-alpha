@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,6 +67,7 @@ class CandidateResult:
 class StrategyRegistry:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._lock = Lock()
         self.data = self._load()
 
     def _load(self) -> Dict[str, Any]:
@@ -80,8 +82,9 @@ class StrategyRegistry:
         return counters["evolution_id"]
 
     def append_run(self, payload: Dict[str, Any]) -> None:
-        self.data.setdefault("evolution_runs", []).append(payload)
-        self._save()
+        with self._lock:
+            self.data.setdefault("evolution_runs", []).append(payload)
+            self._save_locked()
 
     def best_parent(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
         runs = [
@@ -90,10 +93,16 @@ class StrategyRegistry:
         ]
         if not runs:
             return None
-        runs.sort(key=lambda r: (float(r.get("score", 0.0)), float(r.get("metrics", {}).get("backtest", {}).get("profit_factor", 0.0))), reverse=True)
+        runs.sort(
+            key=lambda r: (
+                float(r.get("score", 0.0)),
+                float(r.get("metrics", {}).get("backtest", {}).get("profit_factor", 0.0)),
+            ),
+            reverse=True,
+        )
         return runs[0]
 
-    def _save(self) -> None:
+    def _save_locked(self) -> None:
         tmp = self.path.with_suffix(".tmp")
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(self.data, f, indent=2, ensure_ascii=False)
@@ -246,7 +255,6 @@ def compute_ranking_score(metrics: Dict[str, Any]) -> float:
     backtest = metrics.get("backtest", {}) or {}
     wf = metrics.get("walk_forward", {}) or {}
     mc = metrics.get("monte_carlo", {}) or {}
-
     pf = safe_float(backtest.get("profit_factor"), 0.0)
     wr = safe_float(backtest.get("win_rate"), 0.0)
     ret = safe_float(backtest.get("return_pct"), 0.0)
@@ -359,13 +367,6 @@ def resolve_evaluator() -> Callable[..., Any]:
     raise RuntimeError("Could not locate an evaluator/backtest function. Update EVALUATOR_MODULE_CANDIDATES / EVALUATOR_FUNCTION_CANDIDATES.")
 
 
-def _attempt_call(fn: Callable[..., Any], args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Any:
-    try:
-        return fn(*args, **kwargs)
-    except TypeError:
-        return None
-
-
 def call_evaluator(
     evaluator: Callable[..., Any],
     *,
@@ -376,37 +377,30 @@ def call_evaluator(
     parameters: Dict[str, Any],
 ) -> Dict[str, Any]:
     sig = inspect.signature(evaluator)
-    param_names = list(sig.parameters.keys())
+    names = list(sig.parameters.keys())
 
-    kwargs_variants = [
-        {"sym": symbol, "tf": timeframe, "start": start, "end": end, "parameters": parameters},
-        {"symbol": symbol, "timeframe": timeframe, "start": start, "end": end, "parameters": parameters},
-        {"sym": symbol, "tf": timeframe, "start": start, "end": end, "params": parameters},
-        {"symbol": symbol, "timeframe": timeframe, "start": start, "end": end, "params": parameters},
-        {"sym": symbol, "tf": timeframe, "start": start, "end": end},
-        {"symbol": symbol, "timeframe": timeframe, "start": start, "end": end},
-        {"parameters": parameters},
-        {"params": parameters},
+    # Try the repo's common backtest signature first: run_backtest(sym, tf, start, end, params)
+    attempts: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = [
+        ((symbol, timeframe, start, end, parameters), {}),
+        ((symbol, timeframe, start, end), {"params": parameters}),
+        ((), {"sym": symbol, "tf": timeframe, "start": start, "end": end, "params": parameters}),
+        ((), {"sym": symbol, "tf": timeframe, "start": start, "end": end, "parameters": parameters}),
+        ((), {"symbol": symbol, "timeframe": timeframe, "start": start, "end": end, "params": parameters}),
+        ((), {"symbol": symbol, "timeframe": timeframe, "start": start, "end": end, "parameters": parameters}),
+        ((symbol, timeframe), {}),
+        ((symbol,), {}),
     ]
 
-    for raw_kwargs in kwargs_variants:
-        kwargs = {k: v for k, v in raw_kwargs.items() if k in param_names}
-        if not kwargs and not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+    for args, kwargs in attempts:
+        try:
+            if kwargs:
+                filtered = {k: v for k, v in kwargs.items() if k in names or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())}
+                result = evaluator(*args, **filtered)
+            else:
+                result = evaluator(*args)
+            return normalize_evaluation_output(result)
+        except TypeError:
             continue
-        result = _attempt_call(evaluator, tuple(), kwargs)
-        if result is not None:
-            return normalize_evaluation_output(result)
-
-    positional_variants = [
-        (symbol, timeframe, start, end, parameters),
-        (symbol, timeframe, start, end),
-        (symbol, timeframe),
-        (symbol,),
-    ]
-    for args in positional_variants:
-        result = _attempt_call(evaluator, args, {})
-        if result is not None:
-            return normalize_evaluation_output(result)
 
     raise TypeError("Unable to call evaluator with supported signatures.")
 
@@ -472,7 +466,7 @@ def evaluate_one(
     iteration: int,
     candidate_idx: int,
     rng_seed: int,
-) -> CandidateResult:
+) -> Tuple[CandidateResult, Dict[str, Any]]:
     rng = random.Random(rng_seed)
     parent = select_parent(store, symbol, timeframe)
     family = choose_mutation_family(parent, iteration, rng)
@@ -508,9 +502,8 @@ def evaluate_one(
         "parameters": parameters,
         "notes": ", ".join(hard_reasons) if hard_reasons else "",
     }
-    store.append_run(payload)
 
-    return CandidateResult(
+    result = CandidateResult(
         strategy_id=child_id,
         parent_strategy_id=parent.get("strategy_id"),
         child_strategy_id=child_id,
@@ -526,6 +519,7 @@ def evaluate_one(
         symbol=symbol,
         timeframe=timeframe,
     )
+    return result, payload
 
 
 def print_candidate(result: CandidateResult) -> None:
@@ -599,6 +593,7 @@ def main() -> int:
     for iteration in range(1, args.iterations + 1):
         futures = []
         results: List[CandidateResult] = []
+        payloads: List[Dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
             for candidate_idx in range(max(1, args.candidates)):
                 seed = rng.randint(0, 10**9)
@@ -616,9 +611,14 @@ def main() -> int:
                     seed,
                 ))
             for future in as_completed(futures):
-                results.append(future.result())
+                result, payload = future.result()
+                results.append(result)
+                payloads.append(payload)
 
         results.sort(key=lambda r: (r.score, float(r.metrics.get("backtest", {}).get("profit_factor", 0.0))), reverse=True)
+        payloads.sort(key=lambda p: (float(p.get("score", 0.0)), float(p.get("metrics", {}).get("backtest", {}).get("profit_factor", 0.0))), reverse=True)
+        for payload in payloads:
+            store.append_run(payload)
         print_candidate(results[0])
 
     return 0
