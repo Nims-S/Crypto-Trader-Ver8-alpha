@@ -128,8 +128,6 @@ def _row(strategy_id: str, row: dict[str, Any] | None) -> dict[str, Any]:
         "validated_at": row.get("validated_at"),
     }
 
-# classify_strategy_status unchanged
-
 
 def classify_strategy_status(
     *,
@@ -197,8 +195,6 @@ def classify_strategy_status(
         "reasons": reasons,
     }
 
-# upsert_strategy unchanged
-
 
 def upsert_strategy(
     strategy_id: str,
@@ -259,8 +255,6 @@ def upsert_strategy(
         _save(store)
         return _row(strategy_id, row)
 
-# rest unchanged except rank_strategies
-
 
 def list_strategies(active_only: bool = False) -> list[dict[str, Any]]:
     store = _load()
@@ -303,8 +297,6 @@ def rank_strategies(
         reverse=True,
     )
     return rows[:limit]
-
-# rest unchanged
 
 
 def get_strategy(strategy_id: str) -> dict[str, Any]:
