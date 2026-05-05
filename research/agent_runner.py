@@ -9,7 +9,12 @@ from typing import Any
 import pandas as pd
 
 from execution.backtest.core import run_backtest
-from registry.store import record_evolution_run, upsert_strategy, rank_strategies
+from registry.store import (
+    record_evolution_run,
+    upsert_strategy,
+    rank_strategies,
+    classify_strategy_status,
+)
 from research.agent_scoring import AgentScore, score_candidate
 from research.candidate_generator import StrategyCandidate, mutate_parent, seed_strategy
 from research.feedback import build_feedback_summary
@@ -65,7 +70,8 @@ def _normalize_parent(row: Any, symbol: str, timeframe: str) -> dict[str, Any]:
 
 
 def _choose_parent(cfg: AgentConfig) -> dict[str, Any]:
-    ranked = rank_strategies(symbol=cfg.symbol, timeframe=cfg.timeframe, limit=5)
+    # Research should consider all strong strategies, not only deployable ones
+    ranked = rank_strategies(symbol=cfg.symbol, timeframe=cfg.timeframe, active_only=False, limit=10)
     if not ranked:
         return _normalize_parent(None, cfg.symbol, cfg.timeframe)
 
@@ -169,31 +175,38 @@ def _persist_candidate(result: CandidateResult, cfg: AgentConfig) -> None:
     mc = result.monte_carlo
     params = dict(candidate.parameters or {})
 
+    status_info = classify_strategy_status(
+        agent_score=result.score.as_dict(),
+        backtest=bt,
+        walk_forward=wf,
+        timeframe=cfg.timeframe,
+    )
+
     record_evolution_run(
         cycle_id=f"iter_{result.iteration}",
         symbol=cfg.symbol,
         timeframe=cfg.timeframe,
         parent_strategy_id=result.parent_id,
         child_strategy_id=candidate.strategy_id,
-        status="validated" if result.score.passed else "rejected",
+        status=status_info["status"],
         score=float(result.score.score),
         passed=bool(result.score.passed),
         parameters=params,
         metrics={"backtest": bt, "walk_forward": wf, "monte_carlo": mc, "agent_score": result.score.as_dict()},
-        notes=", ".join(result.score.reasons),
+        notes=", ".join(status_info.get("reasons") or []),
     )
 
     upsert_strategy(
         candidate.strategy_id,
         base_strategy=candidate.base_strategy,
         version=int(candidate.version or 1),
-        status="validated" if result.score.passed else "candidate",
+        status=status_info["status"],
         parameters=params,
         metrics={"backtest": bt, "walk_forward": wf, "monte_carlo": mc, "agent_score": result.score.as_dict()},
         tags=list(candidate.tags or []),
         source=candidate.source,
-        notes=", ".join(result.score.reasons),
-        active=bool(result.score.passed),
+        notes=", ".join(status_info.get("reasons") or []),
+        active=bool(status_info.get("active")),
         robustness_score=float(wf.get("score", 0.0) or 0.0),
         parent_strategy_id=result.parent_id,
     )
@@ -210,7 +223,7 @@ def run_agent(cfg: AgentConfig) -> dict[str, Any]:
             break
 
         feedback = build_feedback_summary(symbol=cfg.symbol, timeframe=cfg.timeframe)
-        diversity_pool = rank_strategies(symbol=cfg.symbol, timeframe=cfg.timeframe, limit=10)
+        diversity_pool = rank_strategies(symbol=cfg.symbol, timeframe=cfg.timeframe, active_only=False, limit=10)
 
         children = mutate_parent(
             parent,
