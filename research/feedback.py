@@ -2,7 +2,7 @@
 
 This module reads the strategy store / evolution snapshots and turns rejection
 patterns into concrete mutation directives. It is deliberately conservative:
-- sparse trade activity causes filters to loosen
+- sparse trade activity causes filters to loosen only after a safety floor is met
 - weak profit factor shifts entries toward trend/breakout structures
 - unstable equity curves reduce holding time and position aggressiveness
 """
@@ -17,6 +17,12 @@ from typing import Any
 from research.prompt_templates import build_prompt_bundle
 
 DEFAULT_STORE_PATH = Path(".strategy_store.json")
+
+QUALITY_FLOOR_PF = 1.00
+QUALITY_FLOOR_WR = 0.45
+QUALITY_FLOOR_SPREAD = 0.35
+QUALITY_FLOOR_MAX_DD = 20.0
+QUALITY_FLOOR_MIN_TEST_TRADES = 3.0
 
 
 @dataclass(frozen=True)
@@ -197,11 +203,27 @@ def summarize_store_feedback(
         "test": _mean(test_wr),
     }
 
+    quality_floor_passed = (
+        profit_factor["test"] >= QUALITY_FLOOR_PF
+        and win_rate["test"] >= QUALITY_FLOOR_WR
+        and trade_density["test"] >= QUALITY_FLOOR_MIN_TEST_TRADES
+        and score_spreads
+        and _mean(score_spreads) <= QUALITY_FLOOR_SPREAD
+    )
+
     return {
         "strategy_id": strategy_id,
         "symbol": symbol,
         "timeframe": timeframe,
         "runs_seen": len(runs),
+        "quality_floor_passed": quality_floor_passed,
+        "quality_floor": {
+            "min_pf": QUALITY_FLOOR_PF,
+            "min_wr": QUALITY_FLOOR_WR,
+            "min_test_trades": QUALITY_FLOOR_MIN_TEST_TRADES,
+            "max_score_spread": QUALITY_FLOOR_SPREAD,
+            "max_drawdown": QUALITY_FLOOR_MAX_DD,
+        },
         "failure_profile": FailureProfile(primary=primary, counts=counts, notes=tuple(notes[:25])).__dict__,
         "trade_activity": {
             "mean": trade_density,
@@ -228,6 +250,7 @@ def derive_mutation_directives(feedback: dict[str, Any]) -> dict[str, Any]:
     profile = feedback.get("failure_profile") or {}
     primary = str(profile.get("primary") or "other")
     counts = profile.get("counts") or {}
+    quality_floor_passed = _safe_bool(feedback.get("quality_floor_passed", False), False)
 
     trade_mean = _safe_float((feedback.get("trade_activity") or {}).get("mean", {}).get("test", 0.0), 0.0)
     pf_mean = _safe_float((feedback.get("trade_activity") or {}).get("mean_pf", {}).get("test", 0.0), 0.0)
@@ -243,11 +266,34 @@ def derive_mutation_directives(feedback: dict[str, Any]) -> dict[str, Any]:
         "prefer_breakout": False,
         "prefer_trend_pullback": False,
         "size_multiplier": 1.0,
+        "quality_floor_passed": quality_floor_passed,
     }
 
-    if primary == "no_trades" or trade_mean < 3 or counts.get("no_trades", 0) >= max(counts.get("other", 0), 1):
+    if not quality_floor_passed:
         directives.update(
             {
+                "mode": "stabilize_first",
+                "prefer_structure": True,
+                "prefer_breakout": False,
+                "prefer_trend_pullback": False,
+                "use_htf_filter": True,
+                "use_volume_filter": True,
+                "use_reclaim_filter": False,
+                "use_structure_filter": True,
+                "use_trend_filter": True,
+                "min_adx_delta": 0.0,
+                "min_atr_rank_multiplier": 1.0,
+                "min_bb_rank_multiplier": 1.0,
+                "max_bars_override": 24,
+                "tp1_close_fraction": 0.25,
+                "tp2_close_fraction": 0.35,
+                "be_trigger_rr": 1.5,
+            }
+        )
+    elif primary == "no_trades" or trade_mean < 3 or counts.get("no_trades", 0) >= max(counts.get("other", 0), 1):
+        directives.update(
+            {
+                "mode": "density_after_floor",
                 "loosen_filters": True,
                 "prefer_breakout": True,
                 "prefer_trend_pullback": False,
@@ -257,9 +303,9 @@ def derive_mutation_directives(feedback: dict[str, Any]) -> dict[str, Any]:
                 "use_reclaim_filter": False,
                 "use_structure_filter": False,
                 "use_trend_filter": False,
-                "min_adx_delta": -5.0,
-                "min_atr_rank_multiplier": 0.5,
-                "min_bb_rank_multiplier": 0.5,
+                "min_adx_delta": -3.0,
+                "min_atr_rank_multiplier": 0.75,
+                "min_bb_rank_multiplier": 0.75,
                 "entry_mode": "breakout",
                 "tp1_close_fraction": 0.20,
                 "tp2_close_fraction": 0.30,
@@ -270,6 +316,7 @@ def derive_mutation_directives(feedback: dict[str, Any]) -> dict[str, Any]:
     elif primary == "low_profit_factor" or (trade_mean >= 3 and pf_mean < 1.10):
         directives.update(
             {
+                "mode": "profit_factor",
                 "tighten_exits": True,
                 "prefer_breakout": pf_mean < 1.0,
                 "prefer_trend_pullback": pf_mean >= 1.0,
@@ -290,6 +337,7 @@ def derive_mutation_directives(feedback: dict[str, Any]) -> dict[str, Any]:
     elif primary == "high_drawdown":
         directives.update(
             {
+                "mode": "drawdown",
                 "shorten_holding": True,
                 "prefer_structure": True,
                 "size_multiplier": 0.80,
@@ -303,18 +351,19 @@ def derive_mutation_directives(feedback: dict[str, Any]) -> dict[str, Any]:
     elif primary == "unstable" or spread > 0.25:
         directives.update(
             {
-                "loosen_filters": True,
-                "prefer_breakout": True,
-                "use_htf_filter": False,
-                "use_structure_filter": False,
+                "mode": "stability",
+                "loosen_filters": False,
+                "prefer_breakout": False,
+                "use_htf_filter": True,
+                "use_structure_filter": True,
                 "use_reclaim_filter": False,
-                "entry_mode": "breakout",
+                "entry_mode": "trend_pullback",
                 "size_multiplier": 0.90 if wr_mean < 0.45 else 1.0,
                 "max_bars_override": 18,
             }
         )
 
-    if wr_mean < 0.40 and trade_mean >= 3:
+    if wr_mean < 0.40 and trade_mean >= 3 and quality_floor_passed:
         directives["entry_mode"] = "mean_reversion"
         directives["use_reclaim_filter"] = True
         directives["use_volume_filter"] = False
@@ -341,13 +390,14 @@ def build_feedback_summary(
     )
     feedback["mutation_directives"] = derive_mutation_directives(feedback)
 
-    # Build compact prompt bundle for LLM-driven evolution (fast, minimal context)
     prompt_context = {
         "symbol": symbol,
         "timeframe": timeframe,
         "failure_profile": feedback.get("failure_profile"),
         "trade_activity": feedback.get("trade_activity"),
         "score_spread": feedback.get("score_spread"),
+        "quality_floor_passed": feedback.get("quality_floor_passed"),
+        "quality_floor": feedback.get("quality_floor"),
         "mutation_directives": feedback.get("mutation_directives"),
     }
     feedback["prompt_bundle"] = build_prompt_bundle(prompt_context)
