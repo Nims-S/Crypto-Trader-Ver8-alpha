@@ -256,6 +256,74 @@ def upsert_strategy(
         return _row(strategy_id, row)
 
 
+def record_experiment(
+    strategy_id: str,
+    *,
+    symbol: str,
+    timeframe: str,
+    run_type: str = "backtest",
+    parameters: dict[str, Any] | None = None,
+    metrics: dict[str, Any] | None = None,
+    passed: bool = False,
+    notes: str = "",
+) -> dict[str, Any]:
+    with _STORE_LOCK:
+        store = _load()
+        store["counters"]["experiment_id"] = int(store["counters"].get("experiment_id", 0)) + 1
+        row = {
+            "id": store["counters"]["experiment_id"],
+            "strategy_id": strategy_id,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "run_type": run_type,
+            "parameters": _jsonable(parameters or {}),
+            "metrics": _jsonable(metrics or {}),
+            "passed": bool(passed),
+            "notes": notes,
+            "created_at": _now(),
+        }
+        store["experiments"].append(row)
+        _save(store)
+        return row
+
+
+def record_evolution_run(
+    *,
+    cycle_id: str,
+    symbol: str,
+    timeframe: str,
+    parent_strategy_id: str | None,
+    child_strategy_id: str,
+    status: str,
+    score: float = 0.0,
+    passed: bool = False,
+    parameters: dict[str, Any] | None = None,
+    metrics: dict[str, Any] | None = None,
+    notes: str = "",
+) -> dict[str, Any]:
+    with _STORE_LOCK:
+        store = _load()
+        store["counters"]["evolution_id"] = int(store["counters"].get("evolution_id", 0)) + 1
+        row = {
+            "id": store["counters"]["evolution_id"],
+            "cycle_id": cycle_id,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "parent_strategy_id": parent_strategy_id,
+            "child_strategy_id": child_strategy_id,
+            "status": _normalize_status(status),
+            "score": float(score),
+            "passed": bool(passed),
+            "parameters": _jsonable(parameters or {}),
+            "metrics": _jsonable(metrics or {}),
+            "notes": notes,
+            "created_at": _now(),
+        }
+        store["evolution_runs"].append(row)
+        _save(store)
+        return row
+
+
 def list_strategies(active_only: bool = False) -> list[dict[str, Any]]:
     store = _load()
     rows = [_row(strategy_id, row) for strategy_id, row in store["registry"].items()]
