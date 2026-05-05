@@ -70,12 +70,43 @@ def _normalize_parent(row: Any, symbol: str, timeframe: str) -> dict[str, Any]:
         }
 
 
-def _choose_parent(cfg: AgentConfig) -> dict[str, Any]:
+def _composite_parent_score(row: dict[str, Any]) -> float:
+    metrics = row.get("metrics") or {}
+    agent = metrics.get("agent_score") or {}
+    wf = metrics.get("walk_forward") or {}
+    bt = metrics.get("backtest") or {}
+    robustness = float(row.get("robustness_score", 0.0) or 0.0)
+    return (
+        0.45 * float(agent.get("score", 0.0) or 0.0)
+        + 0.30 * float(wf.get("score", 0.0) or 0.0)
+        + 0.15 * min(max(0.0, float(bt.get("return_pct", 0.0) or 0.0)) / 2.0, 1.0)
+        + 0.10 * robustness
+    )
+
+
+def _choose_parent(cfg: AgentConfig, prev_parent_id: str | None = None) -> dict[str, Any]:
     ranked = rank_strategies(symbol=cfg.symbol, timeframe=cfg.timeframe, active_only=False, limit=10)
     if not ranked:
         return _normalize_parent(None, cfg.symbol, cfg.timeframe)
 
-    return _normalize_parent(ranked[0], cfg.symbol, cfg.timeframe)
+    pool = ranked[: min(5, len(ranked))]
+    if prev_parent_id:
+        alt_pool = [r for r in pool if str(r.get("strategy_id")) != str(prev_parent_id)]
+        if alt_pool:
+            pool = alt_pool
+
+    weights = []
+    for row in pool:
+        score = max(0.0, _composite_parent_score(row))
+        weights.append(score if score > 0 else 0.01)
+
+    total = sum(weights)
+    if total <= 0:
+        choice = random.choice(pool)
+        return _normalize_parent(choice, cfg.symbol, cfg.timeframe)
+
+    choice = random.choices(pool, weights=weights, k=1)[0]
+    return _normalize_parent(choice, cfg.symbol, cfg.timeframe)
 
 
 def _split_window(start: str, end: str) -> tuple[tuple[str, str], tuple[str, str], tuple[str, str]]:
@@ -210,6 +241,7 @@ def run_agent(cfg: AgentConfig) -> dict[str, Any]:
     best_overall: CandidateResult | None = None
 
     llm_client = get_default_llm_client()
+    prev_parent_id: str | None = None
 
     iteration = 0
     while True:
@@ -276,16 +308,19 @@ def run_agent(cfg: AgentConfig) -> dict[str, Any]:
                 "monte_carlo": best.monte_carlo,
             }
 
+        # Explore from the next strongest parent instead of the same lineage every loop.
+        next_parent = _choose_parent(cfg, prev_parent_id=parent_id)
+        prev_parent_id = parent_id
         parent = _normalize_parent(
             {
-                "strategy_id": best.candidate.strategy_id,
-                "base_strategy": best.candidate.base_strategy,
-                "version": best.candidate.version,
-                "parameters": best.candidate.parameters,
+                "strategy_id": next_parent.get("strategy_id") if isinstance(next_parent, dict) else parent_id,
+                "base_strategy": next_parent.get("base_strategy") if isinstance(next_parent, dict) else best.candidate.base_strategy,
+                "version": next_parent.get("version") if isinstance(next_parent, dict) else best.candidate.version,
+                "parameters": next_parent.get("parameters") if isinstance(next_parent, dict) else best.candidate.parameters,
                 "symbol": cfg.symbol,
                 "timeframe": cfg.timeframe,
-                "tags": best.candidate.tags,
-                "source": best.candidate.source,
+                "tags": next_parent.get("tags") if isinstance(next_parent, dict) else best.candidate.tags,
+                "source": next_parent.get("source") if isinstance(next_parent, dict) else best.candidate.source,
             },
             cfg.symbol,
             cfg.timeframe,
