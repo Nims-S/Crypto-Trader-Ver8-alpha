@@ -14,9 +14,33 @@ from typing import Any, List
 _STORE_PATH = Path(os.getenv("STRATEGY_STORE_FILE", ".strategy_store.json"))
 _STORE_LOCK = threading.RLock()
 
+STATUS_ORDER = {
+    "retired": 0,
+    "disabled": 1,
+    "candidate": 2,
+    "validated": 3,
+    "deployable": 4,
+    "live": 5,
+}
+
+VALIDATED_SCORE_THRESHOLD = 0.70
+VALIDATED_DENSITY_FLOOR = 0.35
+DEPLOYABLE_DENSITY_FLOOR = 0.60
+DEPLOYABLE_MAX_DRAWDOWN_PCT = 15.0
+DEPLOYABLE_MIN_TRADES = 12
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_status(status: Any) -> str:
+    value = str(status or "candidate").strip().lower()
+    return value if value in STATUS_ORDER else "candidate"
+
+
+def _status_rank(status: Any) -> int:
+    return STATUS_ORDER.get(_normalize_status(status), STATUS_ORDER["candidate"])
 
 
 def compute_logic_hash(parameters: dict[str, Any] | None) -> str:
@@ -69,7 +93,7 @@ def _row(strategy_id: str, row: dict[str, Any] | None) -> dict[str, Any]:
         "strategy_id": strategy_id,
         "base_strategy": row.get("base_strategy", "unknown"),
         "version": int(row.get("version", 1) or 1),
-        "status": row.get("status", "candidate"),
+        "status": _normalize_status(row.get("status", "candidate")),
         "parameters": row.get("parameters", {}) or {},
         "metrics": row.get("metrics", {}) or {},
         "tags": row.get("tags", []) or [],
@@ -83,6 +107,73 @@ def _row(strategy_id: str, row: dict[str, Any] | None) -> dict[str, Any]:
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
         "validated_at": row.get("validated_at"),
+    }
+
+
+def classify_strategy_status(
+    *,
+    agent_score: dict[str, Any] | None = None,
+    backtest: dict[str, Any] | None = None,
+    walk_forward: dict[str, Any] | None = None,
+    timeframe: str | None = None,
+) -> dict[str, Any]:
+    agent_score = agent_score or {}
+    backtest = backtest or {}
+    walk_forward = walk_forward or {}
+
+    score = float(agent_score.get("score", 0.0) or 0.0)
+    score_passed = bool(agent_score.get("passed", False))
+    score_reasons = [str(r) for r in (agent_score.get("reasons") or [])]
+
+    bt_return = float(backtest.get("return_pct", 0.0) or 0.0)
+    bt_pf = float(backtest.get("profit_factor", 0.0) or 0.0)
+    bt_wr = float(backtest.get("win_rate", 0.0) or 0.0)
+    bt_dd = abs(float(backtest.get("max_drawdown_pct", 0.0) or 0.0))
+    bt_trades = int(backtest.get("trades", 0) or 0)
+
+    wf_passed = bool(walk_forward.get("passed", False))
+    wf_score = float(walk_forward.get("score", 0.0) or 0.0)
+    wf_spread = abs(float(walk_forward.get("score_spread", 0.0) or 0.0))
+    wf_density = float(walk_forward.get("density_mean", 0.0) or 0.0)
+    wf_reasons = [str(r) for r in (walk_forward.get("reasons") or [])]
+
+    deployment_quality = (
+        score_passed
+        and wf_passed
+        and bt_trades >= DEPLOYABLE_MIN_TRADES
+        and wf_density >= DEPLOYABLE_DENSITY_FLOOR
+        and bt_dd <= DEPLOYABLE_MAX_DRAWDOWN_PCT
+        and bt_return >= 0.0
+        and bt_pf >= 0.95
+        and bt_wr >= 0.40
+        and wf_spread <= 0.40
+    )
+
+    validation_quality = (
+        score >= VALIDATED_SCORE_THRESHOLD
+        and bt_return >= 0.0
+        and bt_pf >= 0.95
+        and bt_wr >= 0.40
+        and bt_dd <= DEPLOYABLE_MAX_DRAWDOWN_PCT
+        and (wf_score >= VALIDATED_SCORE_THRESHOLD * 0.55 or wf_density >= VALIDATED_DENSITY_FLOOR)
+    )
+
+    if deployment_quality:
+        status = "deployable"
+    elif validation_quality:
+        status = "validated"
+    else:
+        status = "candidate"
+
+    active = status in {"deployable", "live"}
+    reasons = list(dict.fromkeys(score_reasons + wf_reasons))
+    return {
+        "status": status,
+        "active": active,
+        "score": score,
+        "score_passed": score_passed,
+        "walk_forward_passed": wf_passed,
+        "reasons": reasons,
     }
 
 
@@ -107,6 +198,7 @@ def upsert_strategy(
     with _STORE_LOCK:
         store = _load()
         now = _now()
+        existing = store["registry"].get(strategy_id, {}) or {}
 
         extras = dict(kwargs or {})
         if extras:
@@ -117,21 +209,26 @@ def upsert_strategy(
             parameters = params
 
         logic_hash = compute_logic_hash(parameters)
+        incoming_status = _normalize_status(status)
+        existing_status = _normalize_status(existing.get("status", "candidate"))
+        final_status = incoming_status if _status_rank(incoming_status) >= _status_rank(existing_status) else existing_status
+        final_active = bool(active) or bool(existing.get("active", False)) or final_status in {"deployable", "live"}
+
         row = {
             "base_strategy": base_strategy,
             "version": int(version or 1),
-            "status": status,
+            "status": final_status,
             "parameters": _jsonable(parameters or {}),
             "metrics": _jsonable(metrics or {}),
             "tags": _jsonable(tags or []),
             "source": source,
             "notes": notes,
-            "active": bool(active),
+            "active": bool(final_active),
             "logic_hash": logic_hash,
             "regime_profile": regime_profile,
             "robustness_score": float(robustness_score or 0.0),
             "parent_strategy_id": parent_strategy_id,
-            "created_at": store["registry"].get(strategy_id, {}).get("created_at", now),
+            "created_at": existing.get("created_at", now),
             "updated_at": now,
             "validated_at": validated_at.isoformat() if hasattr(validated_at, "isoformat") else validated_at,
         }
@@ -195,7 +292,7 @@ def record_evolution_run(
             "timeframe": timeframe,
             "parent_strategy_id": parent_strategy_id,
             "child_strategy_id": child_strategy_id,
-            "status": status,
+            "status": _normalize_status(status),
             "score": float(score),
             "passed": bool(passed),
             "parameters": _jsonable(parameters or {}),
@@ -244,7 +341,9 @@ def rank_strategies(
         agent = m.get("agent_score") or {}
         wf = m.get("walk_forward") or {}
         bt = m.get("backtest") or {}
+        status = r.get("status") or "candidate"
         return (
+            _status_rank(status),
             float(agent.get("score", 0.0)),
             float(wf.get("score", 0.0)),
             float(bt.get("return_pct", 0.0)),
@@ -278,7 +377,6 @@ def list_evolution_runs(strategy_id: str | None = None, limit: int = 100) -> lis
 
 
 def export_trade_history(strategy_id: str | None = None, limit: int = 1000, run_type: str | None = None) -> list[dict[str, Any]]:
-    """Return a normalized trade-like history from registry experiments."""
     rows = list_experiments(strategy_id=strategy_id, limit=max(1, int(limit)), run_type=run_type)
     out: list[dict[str, Any]] = []
     for row in rows:
