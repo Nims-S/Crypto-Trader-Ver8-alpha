@@ -28,10 +28,8 @@ async def batch_prompts_async(
 
     async def _worker(job: PromptJob):
         async with sem:
-            # If client is async, await it; if sync, offload the entire call.
-            maybe = client(job.prompt)
-            if inspect.isawaitable(maybe):
-                result = await maybe
+            if inspect.iscoroutinefunction(client):
+                result = await client(job.prompt)
             else:
                 result = await asyncio.to_thread(client, job.prompt)
             return job.name, result
