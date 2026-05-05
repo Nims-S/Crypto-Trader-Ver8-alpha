@@ -9,6 +9,15 @@ from strategy.signals.mean_reversion import generate as mr_generate
 from strategy.signals.breakout import generate as breakout_generate
 
 
+def _normalize_mode(mode: Any) -> str:
+    value = str(mode or "").strip().lower()
+    if value in {"trend_pullback", "trend_following", "trend"}:
+        return "trend"
+    if value in {"breakout", "mean_reversion"}:
+        return value
+    return ""
+
+
 def generate_signal(
     df,
     state: StrategyState,
@@ -17,7 +26,7 @@ def generate_signal(
     strategy_override: dict[str, Any] | None = None,
 ):
     if strategy_override:
-        mode = strategy_override.get("entry_mode")
+        mode = _normalize_mode(strategy_override.get("entry_mode"))
         if mode == "trend":
             return trend_generate(df, symbol, state, df_htf=df_htf, strategy_override=strategy_override)
         if mode == "breakout":
