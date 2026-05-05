@@ -19,6 +19,7 @@ from research.agent_scoring import AgentScore, score_candidate
 from research.candidate_generator import StrategyCandidate, mutate_parent, seed_strategy
 from research.feedback import build_feedback_summary
 from research.validation import build_walk_forward_folds, summarize_walk_forward_reports
+from research.llm_client import get_default_llm_client
 
 
 @dataclass(frozen=True)
@@ -70,19 +71,11 @@ def _normalize_parent(row: Any, symbol: str, timeframe: str) -> dict[str, Any]:
 
 
 def _choose_parent(cfg: AgentConfig) -> dict[str, Any]:
-    # Research should consider all strong strategies, not only deployable ones
     ranked = rank_strategies(symbol=cfg.symbol, timeframe=cfg.timeframe, active_only=False, limit=10)
     if not ranked:
         return _normalize_parent(None, cfg.symbol, cfg.timeframe)
 
-    unique = {}
-    for r in ranked:
-        sig = str(r.get("logic_hash") or r.get("strategy_id"))
-        if sig not in unique:
-            unique[sig] = r
-
-    pool = list(unique.values())
-    return random.choice(pool)
+    return _normalize_parent(ranked[0], cfg.symbol, cfg.timeframe)
 
 
 def _split_window(start: str, end: str) -> tuple[tuple[str, str], tuple[str, str], tuple[str, str]]:
@@ -216,6 +209,8 @@ def run_agent(cfg: AgentConfig) -> dict[str, Any]:
     parent = _choose_parent(cfg)
     best_overall: CandidateResult | None = None
 
+    llm_client = get_default_llm_client()
+
     iteration = 0
     while True:
         iteration += 1
@@ -232,6 +227,7 @@ def run_agent(cfg: AgentConfig) -> dict[str, Any]:
             n_children=max(1, int(cfg.candidates)),
             feedback=feedback,
             diversity_pool=diversity_pool,
+            llm_client=llm_client,
         )
 
         results: list[CandidateResult] = []
