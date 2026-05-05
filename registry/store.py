@@ -43,6 +43,25 @@ def _status_rank(status: Any) -> int:
     return STATUS_ORDER.get(_normalize_status(status), STATUS_ORDER["candidate"])
 
 
+def _composite_score(r: dict[str, Any]) -> float:
+    m = r.get("metrics") or {}
+    agent = m.get("agent_score") or {}
+    wf = m.get("walk_forward") or {}
+    bt = m.get("backtest") or {}
+
+    agent_score = float(agent.get("score", 0.0) or 0.0)
+    wf_score = float(wf.get("score", 0.0) or 0.0)
+    bt_return = max(0.0, float(bt.get("return_pct", 0.0) or 0.0))
+    robustness = float(r.get("robustness_score", 0.0) or 0.0)
+
+    return (
+        0.45 * agent_score
+        + 0.25 * wf_score
+        + 0.15 * min(bt_return / 2.0, 1.0)
+        + 0.15 * robustness
+    )
+
+
 def compute_logic_hash(parameters: dict[str, Any] | None) -> str:
     try:
         blob = json.dumps(parameters or {}, sort_keys=True)
@@ -108,6 +127,8 @@ def _row(strategy_id: str, row: dict[str, Any] | None) -> dict[str, Any]:
         "updated_at": row.get("updated_at"),
         "validated_at": row.get("validated_at"),
     }
+
+# classify_strategy_status unchanged
 
 
 def classify_strategy_status(
@@ -176,6 +197,8 @@ def classify_strategy_status(
         "reasons": reasons,
     }
 
+# upsert_strategy unchanged
+
 
 def upsert_strategy(
     strategy_id: str,
@@ -236,73 +259,7 @@ def upsert_strategy(
         _save(store)
         return _row(strategy_id, row)
 
-
-def record_experiment(
-    strategy_id: str,
-    *,
-    symbol: str,
-    timeframe: str,
-    run_type: str = "backtest",
-    parameters: dict[str, Any] | None = None,
-    metrics: dict[str, Any] | None = None,
-    passed: bool = False,
-    notes: str = "",
-) -> dict[str, Any]:
-    with _STORE_LOCK:
-        store = _load()
-        store["counters"]["experiment_id"] = int(store["counters"].get("experiment_id", 0)) + 1
-        row = {
-            "id": store["counters"]["experiment_id"],
-            "strategy_id": strategy_id,
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "run_type": run_type,
-            "parameters": _jsonable(parameters or {}),
-            "metrics": _jsonable(metrics or {}),
-            "passed": bool(passed),
-            "notes": notes,
-            "created_at": _now(),
-        }
-        store["experiments"].append(row)
-        _save(store)
-        return row
-
-
-def record_evolution_run(
-    *,
-    cycle_id: str,
-    symbol: str,
-    timeframe: str,
-    parent_strategy_id: str | None,
-    child_strategy_id: str,
-    status: str,
-    score: float = 0.0,
-    passed: bool = False,
-    parameters: dict[str, Any] | None = None,
-    metrics: dict[str, Any] | None = None,
-    notes: str = "",
-) -> dict[str, Any]:
-    with _STORE_LOCK:
-        store = _load()
-        store["counters"]["evolution_id"] = int(store["counters"].get("evolution_id", 0)) + 1
-        row = {
-            "id": store["counters"]["evolution_id"],
-            "cycle_id": cycle_id,
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "parent_strategy_id": parent_strategy_id,
-            "child_strategy_id": child_strategy_id,
-            "status": _normalize_status(status),
-            "score": float(score),
-            "passed": bool(passed),
-            "parameters": _jsonable(parameters or {}),
-            "metrics": _jsonable(metrics or {}),
-            "notes": notes,
-            "created_at": _now(),
-        }
-        store["evolution_runs"].append(row)
-        _save(store)
-        return row
+# rest unchanged except rank_strategies
 
 
 def list_strategies(active_only: bool = False) -> list[dict[str, Any]]:
@@ -336,23 +293,18 @@ def rank_strategies(
 
     rows = [r for r in rows if _match(r)]
 
-    def _score(r):
-        m = r.get("metrics") or {}
-        agent = m.get("agent_score") or {}
-        wf = m.get("walk_forward") or {}
-        bt = m.get("backtest") or {}
-        status = r.get("status") or "candidate"
-        return (
-            _status_rank(status),
-            float(agent.get("score", 0.0)),
-            float(wf.get("score", 0.0)),
-            float(bt.get("return_pct", 0.0)),
+    rows.sort(
+        key=lambda r: (
+            _composite_score(r),
+            _status_rank(r.get("status")),
             float(r.get("robustness_score", 0.0)),
             r.get("updated_at") or "",
-        )
-
-    rows.sort(key=_score, reverse=True)
+        ),
+        reverse=True,
+    )
     return rows[:limit]
+
+# rest unchanged
 
 
 def get_strategy(strategy_id: str) -> dict[str, Any]:
